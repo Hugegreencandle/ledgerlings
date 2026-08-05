@@ -274,6 +274,134 @@ function drawBandaid(X,cx,cy,bounce){
   X.restore();
 }
 
+// ── Action & Battle Animations (Tamagotchi & Pokémon Handheld Style) ──
+let activeAnim = null; // { type: 'feed'|'play'|'battle', start: ms, duration: ms, win: bool }
+
+function triggerActionAnim(type, opts={}){
+  const duration = (type==='feed'?1600 : type==='play'?1800 : type==='battle'?2400 : 1200);
+  activeAnim = { type, start: performance.now(), duration, win: opts.win!==false };
+  playActionAudio(type, opts.win);
+}
+
+function playActionAudio(type, win){
+  try {
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const now = ctx.currentTime;
+    if(type === 'feed'){
+      [520, 660, 880].forEach((freq, i) => {
+        const osc = ctx.createOscillator(), g = ctx.createGain();
+        osc.type = 'sine'; osc.frequency.value = freq;
+        g.gain.setValueAtTime(0.1, now + i*0.12);
+        g.gain.exponentialRampToValueAtTime(0.01, now + i*0.12 + 0.1);
+        osc.connect(g); g.connect(ctx.destination);
+        osc.start(now + i*0.12); osc.stop(now + i*0.12 + 0.1);
+      });
+    } else if(type === 'play'){
+      const osc = ctx.createOscillator(), g = ctx.createGain();
+      osc.type = 'triangle';
+      osc.frequency.setValueAtTime(400, now);
+      osc.frequency.exponentialRampToValueAtTime(1100, now + 0.25);
+      g.gain.setValueAtTime(0.12, now);
+      g.gain.exponentialRampToValueAtTime(0.01, now + 0.25);
+      osc.connect(g); g.connect(ctx.destination);
+      osc.start(now); osc.stop(now + 0.25);
+    } else if(type === 'battle'){
+      const osc = ctx.createOscillator(), g = ctx.createGain();
+      osc.type = 'sawtooth';
+      osc.frequency.setValueAtTime(320, now);
+      osc.frequency.exponentialRampToValueAtTime(80, now + 0.2);
+      g.gain.setValueAtTime(0.15, now);
+      g.gain.exponentialRampToValueAtTime(0.01, now + 0.2);
+      osc.connect(g); g.connect(ctx.destination);
+      osc.start(now); osc.stop(now + 0.2);
+    }
+  } catch(e){}
+}
+
+function updateDrawAnim(X){
+  if(!activeAnim) return { offsetX: 0, offsetY: 0, bounceAdd: 0, sqAdd: 0 };
+  const elapsed = performance.now() - activeAnim.start;
+  if(elapsed >= activeAnim.duration){
+    activeAnim = null;
+    return { offsetX: 0, offsetY: 0, bounceAdd: 0, sqAdd: 0 };
+  }
+
+  const p = elapsed / activeAnim.duration;
+  let offsetX = 0, offsetY = 0, bounceAdd = 0, sqAdd = 0;
+
+  if(activeAnim.type === 'feed'){
+    if(p < 0.35){
+      const fp = p / 0.35;
+      const ax = 25 + (100 - 25) * fp;
+      const ay = 25 + (105 - 25) * fp - Math.sin(fp * Math.PI) * 30;
+      X.save(); X.font = '22px sans-serif'; X.textAlign = 'center'; X.fillText('🍎', ax, ay); X.restore();
+    } else if(p < 0.75){
+      const cp = (p - 0.35) / 0.4;
+      bounceAdd = Math.abs(Math.sin(cp * Math.PI * 6)) * 7;
+      sqAdd = Math.sin(cp * Math.PI * 6) * 0.15;
+      X.save(); X.font = '16px sans-serif'; X.textAlign = 'center';
+      X.fillText('🍎', 100 + Math.sin(cp * 12) * 3, 110 + Math.cos(cp * 12) * 2); X.restore();
+    } else {
+      const hp = (p - 0.75) / 0.25;
+      bounceAdd = Math.sin(hp * Math.PI) * 12;
+      X.save(); X.font = `${16 + hp * 8}px sans-serif`; X.globalAlpha = Math.max(0, 1 - hp);
+      X.textAlign = 'center'; X.fillText('❤️', 100, 75 - hp * 30); X.restore();
+    }
+  } else if(activeAnim.type === 'play'){
+    if(p < 0.45){
+      const bp = p / 0.45;
+      const bx = 15 + (165 - 15) * bp;
+      const by = 165 - Math.abs(Math.sin(bp * Math.PI * 3)) * 35;
+      X.save(); X.font = '20px sans-serif'; X.textAlign = 'center'; X.fillText('🎾', bx, by); X.restore();
+    } else if(p < 0.8){
+      const lp = (p - 0.45) / 0.35;
+      offsetX = Math.sin(lp * Math.PI) * 45;
+      bounceAdd = Math.abs(Math.sin(lp * Math.PI * 2)) * 14;
+      X.save(); X.font = '20px sans-serif'; X.textAlign = 'center'; X.fillText('🎾', 165, 165); X.restore();
+    } else {
+      const sp = (p - 0.8) / 0.2;
+      bounceAdd = Math.sin(sp * Math.PI) * 10;
+      X.save(); X.font = '18px sans-serif'; X.globalAlpha = Math.max(0, 1 - sp); X.textAlign = 'center';
+      X.fillText('⭐', 75, 80 - sp * 15); X.fillText('✨', 125, 80 - sp * 15); X.restore();
+    }
+  } else if(activeAnim.type === 'battle'){
+    if(p < 0.25){
+      const sp = p / 0.25;
+      offsetX = -35 * sp;
+      X.save(); X.font = '24px sans-serif'; X.textAlign = 'center'; X.globalAlpha = 0.85; X.fillText('👾', 160, 125); X.restore();
+    } else if(p < 0.55){
+      const ap = (p - 0.25) / 0.3;
+      offsetX = -35 + (40 - -35) * Math.sin(ap * Math.PI);
+      bounceAdd = Math.sin(ap * Math.PI) * 6;
+      X.save(); X.font = '24px sans-serif'; X.textAlign = 'center'; X.fillText('👾', 160, 125);
+      X.fillStyle = '#6FF0FF'; X.fillRect(40, 115, 25, 2); X.fillRect(30, 125, 30, 2);
+      if(ap > 0.3 && ap < 0.85){
+        X.font = '32px sans-serif'; X.fillText('💥', 160, 110);
+        X.font = '22px sans-serif'; X.fillText('⚔️', 170, 90);
+      }
+      X.restore();
+    } else if(p < 0.75){
+      const rp = (p - 0.55) / 0.2;
+      offsetX = 40 - (40 - 0) * rp;
+      if(!activeAnim.win){
+        X.save(); X.fillStyle = 'rgba(255,50,50,0.22)'; X.fillRect(0,0,200,220); X.restore();
+      }
+    } else {
+      const vp = (p - 0.75) / 0.25;
+      if(activeAnim.win){
+        bounceAdd = Math.abs(Math.sin(vp * Math.PI * 3)) * 18;
+        X.save(); X.font = '22px sans-serif'; X.textAlign = 'center'; X.globalAlpha = Math.max(0, 1 - vp);
+        X.fillText('🏆', 100, 75 - vp * 20); X.fillText('✨', 70, 85); X.fillText('✨', 130, 85); X.restore();
+      } else {
+        offsetX = Math.sin(vp * Math.PI * 8) * 4;
+        X.save(); X.font = '16px sans-serif'; X.textAlign = 'center'; X.fillText('💧', 115, 95); X.restore();
+      }
+    }
+  }
+
+  return { offsetX, offsetY, bounceAdd, sqAdd };
+}
+
 // ── main render loop ──
 const C=document.getElementById('c'),X=C.getContext('2d');
 let lastJoy=-1e9;
@@ -290,8 +418,9 @@ function tick(){
   const mkt=(window.MarketMood?MarketMood.get():null);
   // shake wobble: a decaying horizontal jitter layered on the normal bounce. Visual only.
   const sw = shakeActive() ? Math.sin(performance.now()/28)*7*((shakeUntil-performance.now())/600) : 0;
-  drawPet(X,100+sw,120,bp*5,(1-bp)*0.2,0.25+0.25*bp,mood(),mkt);
-  if(scuffed()) drawBandaid(X,100+sw,120,bp*5);
+  const anim = updateDrawAnim(X);
+  drawPet(X,100+sw+anim.offsetX,120+anim.offsetY,bp*5+anim.bounceAdd,(1-bp)*0.2+anim.sqAdd,0.25+0.25*bp,mood(),mkt);
+  if(scuffed()) drawBandaid(X,100+sw+anim.offsetX,120+anim.offsetY,bp*5+anim.bounceAdd);
   updateMoodBadge(mkt);
   // hud
   document.getElementById('bH').style.width=pet.hunger+'%';
@@ -365,6 +494,7 @@ setInterval(refreshOps,1000);
 async function runOp(op){
   const before=JSON.stringify(pet);
   if(!opReady(op)){ toast(op+' on cooldown'); return; }    // don't spend a signature on a no-op
+  if(op==='feed'||op==='play') triggerActionAnim(op);
   if(xamanReady){                                          // REAL: sign a Payment+memo in Xaman; issuer applies the rules + NFTokenModify
     const r=await XamanBridge.interact(op,petNid);
     if(r.local){ /* fell back */ } else if(!r.signed){ toast('cancelled'); return; }
@@ -500,6 +630,7 @@ async function refreshRank(){
   }catch{ /* rank is cosmetic */ }
 }
 async function challengeRung(rung,name){
+  triggerActionAnim('battle', { win: true });
   const j=await signRequest(
     {kind:'ladder', owner:OWNER, nid:petNid, rung},
     'Challenge '+name,
@@ -524,6 +655,7 @@ function watchBattle(battleId){
       if(b && b.result){
         clearInterval(t);
         const won=b.result.winnerNid===petNid;
+        triggerActionAnim('battle', { win: won });
         msg.textContent=won?'you won that one 🏆':(b.result.winnerNid==='DRAW'?'a draw':'you lost that one');
         toast(won?'ladder win 🏆':'ladder result in');
         refreshRank(); pullLive();
