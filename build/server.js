@@ -475,6 +475,15 @@ function seedFor(ledgerHash, battleId, aNid, bNid) {
 function stateAtLedger(genesis, interactions, N) {
   return replay(genesis, interactions.filter(([, lseq]) => lseq <= N));
 }
+// Advance a replayed state to ledger N with no action, so decay and any resulting death are applied.
+// replay() stops at the last interaction; a pet nobody has touched therefore reads at full strength
+// forever, which is why an untouched pet's death never lands on-chain. Used by ghost fights so an
+// opponent snapshot reflects the pet as it actually is. Deterministic: same inputs, same output,
+// and the public verifier runs the identical call.
+function projectTo(s, N) {
+  if (!s || !s.owner) return s;
+  try { return R.step(s, null, Number(N), s.owner); } catch { return s; }
+}
 async function ledgerHashOf(c, N) {
   const r = await c.request({ command: 'ledger', ledger_index: Number(N) });
   return (r.result.ledger && r.result.ledger.ledger_hash) || r.result.ledger_hash || null;
@@ -516,6 +525,12 @@ async function loadBattle(c, issuer, battleId) {
           const f = unhex(md.MemoData || '').split('|'), kind = f[0];
           if (kind === 'challenge' && hash === battleId && toIssuer && !out.challenge) out.challenge = { aNid: f[1], stakeDrops: f[2], N: Number(f[3]), ownerA: tx.Account, delivered: (t.meta && t.meta.delivered_amount) || tx.Amount, lseq };
           else if (kind === 'ladder' && hash === battleId && toIssuer && !out.challenge) out.challenge = { aNid: f[1], rung: Number(f[2]), N: Number(f[3]), ownerA: tx.Account, npc: true, lseq };
+          // GHOST: fight a SNAPSHOT of another player's pet. Structurally this is a ladder fight
+          // whose opponent stats come from a real pet's derived state instead of the NPC table, so
+          // it has exactly ONE commitment and needs no second human. The accept-derived seed rule
+          // exists only to stop a second mover peeking at the dice; with no second mover there is
+          // nothing to peek at, which is why this reuses the ladder's already-verified seeding.
+          else if (kind === 'ghost' && hash === battleId && toIssuer && !out.challenge) out.challenge = { aNid: f[1], ghostNid: f[2], N: Number(f[3]), ownerA: tx.Account, ghost: true, lseq };
           else if (kind === 'accept' && f[1] === battleId && toIssuer) out.accepts.push({ bNid: f[2], ownerB: tx.Account, delivered: (t.meta && t.meta.delivered_amount) || tx.Amount, lseq, hash });
           else if (kind === 'result' && f[1] === battleId && byIssuer && !out.result) out.result = { winnerNid: f[2], scoreA: Number(f[3]), scoreB: Number(f[4]), rv: f[5], dest: tx.Destination, lseq };
           else if (kind === 'refund' && f[1] === battleId && byIssuer && (f[2] === 'A' || f[2] === 'B')) out.refunds[f[2]] = { dest: tx.Destination, drops: (t.meta && t.meta.delivered_amount) || tx.Amount, lseq };
@@ -657,12 +672,90 @@ async function refundBoth(c, w, battleId, b, deliveredA, deliveredB, resultMemo)
   return { refunds };
 }
 
+// GHOST FIGHT. The challenger fights a SNAPSHOT of another player's pet, derived from that pet's
+// real ledger history at the seed ledger. One commitment, no second human, and no wallet round-trip
+// from the ghost's owner — which is the whole point, because pvpPlayed sat at 0 while every pet
+// waiting to be challenged belonged to somebody who had stopped signing anything.
+//
+// Fairness is inherited from the ladder rather than argued from scratch: the seed ledger is derived
+// from the ledger the challenge LANDED in, so it is strictly in the future at the only commitment
+// there is. There is no second mover, so there is nobody who could have peeked at the dice.
+//
+// The ghost's record is never touched. See the leaderboard fold: a ghost battle credits only the
+// challenger. Their owner did not agree to fight and must not carry a loss for it.
+async function resolveGhost(c, w, battleId, b) {
+  const issuer = w.classicAddress;
+  const { aNid, ghostNid, ownerA, lseq } = b.challenge;
+  if (!ghostNid || !/^[0-9A-F]{64}$/i.test(ghostNid)) return { error: 'bad ghost id', battleId };
+  if (ghostNid === aNid) return { error: 'a pet cannot fight its own ghost', battleId };
+  if (!lseq) return { error: 'challenge ledger unknown', battleId };
+
+  const claimedN = b.challenge.N;
+  const N = lseq + BATTLE_LEDGER_MARGIN;
+  const staleCommitment = Number.isInteger(claimedN) && claimedN > 1000000 && claimedN <= lseq;
+  const lh = await ledgerHashOf(c, N);
+  if (!lh) return { error: 'pinned ledger not validated yet', N };
+
+  const hA = await loadHistory(c, issuer, aNid);
+  if (!hA.genesis) return { error: 'pet not found' };
+  const hG = await loadHistory(c, issuer, ghostNid);
+  if (!hG.genesis) return { error: 'ghost not found' };
+  // PROJECTED, not merely replayed. stateAtLedger replays interactions up to N and stops, so a pet
+  // with no interactions since ledger X is evaluated at its strength AT X — full stats, alive,
+  // forever. For a ghost that is exactly backwards: the seven abandoned pets in this game would
+  // become permanently strong opponents, and a pet that starved to death would still fight, because
+  // decay and death only commit inside step() when an owner transacts.
+  //
+  // Projecting with a null op applies the same decay the client already shows, so a ghost fights as
+  // it ACTUALLY IS at the seed ledger. It stays fully deterministic and re-derivable — the verifier
+  // does the identical projection — and it is scoped to ghost fights only, so ladder and PvP
+  // semantics are untouched.
+  const sA = projectTo(stateAtLedger(hA.genesis, hA.interactions, N), N);
+  const sG = projectTo(stateAtLedger(hG.genesis, hG.interactions, N), N);
+
+  // Same owner on both sides would let one person farm wins against themselves, and the board is
+  // what the ranking is read from. Checked at resolution, not only at /sign, because a raw Payment
+  // carrying a ghost memo bypasses /sign entirely.
+  if (sA.owner && sG.owner && sA.owner === sG.owner) return { error: 'cannot fight your own pet', battleId };
+
+  // A dead pet forfeits under battle_rules, so an unguarded ghost fight against a neglected pet is a
+  // free win farm — and half this game's pets are dying unattended. VOID instead: nothing is scored,
+  // and the result is still on-ledger and re-derivable so the verifier can confirm the refusal.
+  if (sG.alive === 0) {
+    const voidMemo = [{ Memo: { MemoType: hex(BATTLE_MEMO), MemoData: hex(['result', battleId, 'VOID', 0, 0, RULESET_VERSION].join('|')) } }];
+    const vr = await submit(c, w, { TransactionType: 'Payment', Account: issuer, Destination: ownerA, Amount: '1', Memos: voidMemo });
+    if (vr !== 'tesSUCCESS') return { error: 'void payment did not succeed', result: vr, battleId };
+    return { battleId, ghost: true, status: 'VOID', reason: 'the ghost had already passed; nothing was scored' };
+  }
+
+  const seed = seedFor(lh, battleId, aNid, ghostNid);
+  const d = BR.resolveBattle(seed, sA, sG, aNid, ghostNid);
+  const winnerNid = d.winner === null ? 'DRAW' : d.winner, playerWon = d.winner === aNid;
+  const resultMemo = [{ Memo: { MemoType: hex(BATTLE_MEMO), MemoData: hex(['result', battleId, winnerNid, d.scoreA, d.scoreB, RULESET_VERSION].join('|')) } }];
+  const rr = await submit(c, w, { TransactionType: 'Payment', Account: issuer, Destination: ownerA, Amount: '1', Memos: resultMemo });
+  if (rr !== 'tesSUCCESS') return { error: 'result payment did not succeed', result: rr, battleId, ghost: true };
+
+  let card;
+  if (playerWon) { try {
+    const cp = await c.autofill(tag({ TransactionType: 'NFTokenMint', Account: issuer, NFTokenTaxon: BATTLE_TAXON, Flags: 0,
+      URI: hex(JSON.stringify({ t: 'btl', i: battleId.slice(0, 32), w: aNid.slice(0, 24), N, g: ghostNid.slice(0, 24) })) }));
+    const cs = await c.submitAndWait(cp, { wallet: w });
+    if (cs.result.meta.TransactionResult === 'tesSUCCESS') card = cs.result.hash;
+  } catch (e) { console.warn('[ghost] card mint failed', e.message); } }
+
+  return { battleId, ghost: true, winner: winnerNid, ghostNid, scoreA: d.scoreA, scoreB: d.scoreB,
+    rollA: d.rollA, rollB: d.rollB, powerA: d.powerA, powerB: d.powerB,
+    seedLedger: N, challengeLedger: lseq, seed, card,
+    staleCommitment: staleCommitment || undefined };
+}
+
 async function resolveBattleTx(c, w, battleId) {
   const issuer = w.classicAddress;
   const b = await loadBattle(c, issuer, battleId);
   if (!b.challenge) return { error: 'battle not found', battleId };
   if (b.result) return { status: 'ALREADY_RESOLVED', result: b.result };     // idempotent — never double-pay
   if (b.challenge.npc) return resolveLadder(c, w, battleId, b);               // ladder path (no accept/wager)
+  if (b.challenge.ghost) return resolveGhost(c, w, battleId, b);              // ghost path (no accept, no second human)
   // The FIRST valid accept and nothing else. Later accept memos are inert (see loadBattle): the seed
   // ledger is derived from this one, so a movable accept is a re-rollable dice.
   const picked = await pickAccept(c, issuer, b);
@@ -738,6 +831,45 @@ async function resolveBattleTx(c, w, battleId) {
 async function verifyBattle(c, issuer, battleId) {
   const b = await loadBattle(c, issuer, battleId);
   if (!b.challenge) return { ok: false, verdict: 'NOT_FOUND', reason: 'no challenge with this id' };
+  // GHOST: opponent stats are DERIVED from the ghost pet's own ledger history at the seed ledger,
+  // so they are as checkable as the challenger's. Same single-commitment seeding as the ladder.
+  if (b.challenge.ghost) {
+    if (!b.result) return { ok: false, verdict: 'UNRESOLVED', reason: 'not resolved yet' };
+    const { aNid, ghostNid, lseq } = b.challenge;
+    const claimedN = b.challenge.N;
+    const N = (lseq || 0) + BATTLE_LEDGER_MARGIN;
+    const staleCommitment = Number.isInteger(claimedN) && claimedN > 1000000 && lseq && claimedN <= lseq;
+    const lh = await ledgerHashOf(c, N);
+    if (!lh) return { ok: false, verdict: 'ERROR', reason: 'pinned ledger not available' };
+    const hA = await loadHistory(c, issuer, aNid), hG = await loadHistory(c, issuer, ghostNid);
+    if (!hA.genesis || !hG.genesis) return { ok: false, verdict: 'ERROR', reason: 'pet history unavailable' };
+    // Identical projection to resolveGhost. If these two ever diverge the verifier would report
+    // FAIL on honest fights, which is the failure mode this whole project exists to avoid.
+    const sA = projectTo(stateAtLedger(hA.genesis, hA.interactions, N), N);
+    const sG = projectTo(stateAtLedger(hG.genesis, hG.interactions, N), N);
+    // A VOID here is a POSITIVE result: it means the rules refused to score a fight against a pet
+    // that had already passed. Re-derive that refusal rather than taking the issuer's word for it.
+    if (b.result.winnerNid === 'VOID') {
+      const legit = sG.alive === 0;
+      return { ok: legit, verdict: legit ? 'VOID' : 'FAIL', battleId, ghost: true,
+        reason: legit ? 'voided: the ghost had already passed at the seed ledger, so nothing was scored'
+                      : 'VOID recorded but the ghost was alive at the seed ledger' };
+    }
+    const seed = seedFor(lh, battleId, aNid, ghostNid);
+    const d = BR.resolveBattle(seed, sA, sG, aNid, ghostNid, b.result.rv);
+    const derivedWinner = d.winner === null ? 'DRAW' : d.winner;
+    const ok = derivedWinner === b.result.winnerNid && d.scoreA === b.result.scoreA && d.scoreB === b.result.scoreB;
+    return { ok, verdict: ok ? 'PASS' : 'FAIL', battleId, ghost: true, ghostNid,
+      seedLedger: N, challengeLedger: lseq, claimedN, seed,
+      math: { rollA: d.rollA, powerA: d.powerA, scoreA: d.scoreA, rollB: d.rollB, powerB: d.powerB, scoreB: d.scoreB, rulesetVersion: d.rulesetVersion },
+      names: { a: sA && sA.name ? sA.name : null, b: sG && sG.name ? sG.name : null },
+      nids: { a: aNid, b: ghostNid },
+      ...(staleCommitment ? { warning: 'STALE_COMMITMENT', warningDetail:
+        `the challenge memo pinned ledger ${claimedN}, which had already closed when the challenge landed in ${lseq}.` } : {}),
+      derived: { winner: derivedWinner, scoreA: d.scoreA, scoreB: d.scoreB }, recorded: b.result,
+      reason: ok ? 'winner + scores re-derive from the pinned ledger hash, both pets\' own histories, and the open rules'
+                 : 'recorded ghost result does not match a faithful replay' };
+  }
   if (b.challenge.npc) {   // ladder: opponent stats come from the PUBLISHED NPC table (that is why it stays provably fair)
     if (!b.result) return { ok: false, verdict: 'UNRESOLVED', reason: 'not resolved yet' };
     const { aNid, rung, lseq } = b.challenge, npc = LADDER[rung];
@@ -931,7 +1063,7 @@ app.get('/verify-battle/:battleId', async (req, res) => {
 // payloads under this app's identity and show users transactions we did not author.
 app.post('/sign', async (req, res) => {
   if (!sdk) return res.status(503).json({ error: 'signing not configured (set XAMAN_API_KEY and XAMAN_API_SECRET)' });
-  const { kind, owner, nid, op, rung, battleId } = req.body || {};
+  const { kind, owner, nid, op, rung, battleId, ghostNid } = req.body || {};
   // signin is the one kind that cannot know the address yet — discovering it IS the point.
   // Every other kind still requires a valid owner up front.
   if (kind !== 'signin' && !xrpl.isValidClassicAddress(owner || '')) {
@@ -953,6 +1085,34 @@ app.post('/sign', async (req, res) => {
       txjson = { TransactionType: 'Payment', Account: owner, Destination: ISSUER_ADDRESS || undefined,
         Amount: '10', Memos: [{ Memo: { MemoType: hex('ledgerlings/op'), MemoData: hex(`${op}|${nid}`) } }] };
       instruction = `Ledgerlings: ${op} your pet`;
+
+    } else if (kind === 'ghost') {
+      // Challenge a snapshot of somebody else's pet. No accept, no second signature, no waiting for
+      // a human who may never come back. Mirrors the ladder branch exactly, including writing the
+      // MARGIN rather than an absolute ledger, because the seed is derived at resolution.
+      if (!nid) return res.status(400).json({ error: 'nid required' });
+      const g = String(ghostNid || '').toUpperCase();
+      if (!/^[0-9A-F]{64}$/.test(g)) return res.status(400).json({ error: 'valid ghostNid required' });
+      if (g === String(nid).toUpperCase()) return res.status(400).json({ error: 'a pet cannot fight its own ghost' });
+      const built = await withClient(async (c, w) => {
+        const ps = await readState(c, w.classicAddress, nid);
+        if (!ps) return { error: 'pet not found' };
+        if (ps.owner !== owner) return { error: 'you do not own this pet' };
+        if (ps.alive === 0) return { error: 'a passed pet cannot battle' };
+        const gs = await readState(c, w.classicAddress, g);
+        if (!gs) return { error: 'no such opponent' };
+        if (gs.owner === owner) return { error: 'pick somebody else\'s pet' };
+        // Checked here for a clear error; resolution re-checks against DERIVED state, because a pet
+        // that reads alive today can be derived-dead by the seed ledger and this check is advisory.
+        if (gs.alive === 0) return { error: 'that pet has passed' };
+        const cur = (await c.request({ command: 'ledger', ledger_index: 'validated' })).result.ledger_index;
+        return { N: cur + BATTLE_LEDGER_MARGIN, tx: { TransactionType: 'Payment', Account: owner, Destination: w.classicAddress, Amount: '1',
+          Memos: [{ Memo: { MemoType: hex(BATTLE_MEMO), MemoData: hex(['ghost', nid, g, String(BATTLE_LEDGER_MARGIN)].join('|')) } }] } };
+      });
+      if (built.error) return res.status(400).json(built);
+      txjson = built.tx;
+      instruction = `Ledgerlings: fight the ghost of ${g.slice(0, 8)}`;
+      res.locals = { pinnedLedger: built.N };
 
     } else if (kind === 'ladder') {
       if (!LADDER[rung]) return res.status(400).json({ error: 'invalid rung (see GET /ladder)' });
@@ -1037,7 +1197,7 @@ app.post('/sign', async (req, res) => {
       // No res.locals: there is no pinnedLedger for an accept, and this tx's own hash is NOT the battleId.
 
     } else {
-      return res.status(400).json({ error: "kind must be 'interact', 'ladder', 'challenge' or 'accept'" });
+      return res.status(400).json({ error: "kind must be 'interact', 'ladder', 'ghost', 'challenge' or 'accept'" });
     }
 
     // A SignIn payload proves control of an address and moves nothing, so it is not
@@ -1187,6 +1347,10 @@ app.get('/leaderboard', async (req, res) => {
               // the last one the #1 slot was purchasable — forge a result memo naming your own pet.
               if (kind === 'challenge' && hash && toIssuer) { const b = bat(hash); if (b.aNid == null) b.aNid = f[1]; }
               else if (kind === 'ladder' && hash && toIssuer) { const b = bat(hash); if (b.aNid == null) { b.aNid = f[1]; b.rung = Number(f[2]); b.ladder = true; } }
+              // b.ghostNid is recorded for display only. It is deliberately NOT set as b.bNid,
+              // because bNid is what the leaderboard credits — and a ghost's owner never agreed to
+              // fight, so a loss must never land on their public record.
+              else if (kind === 'ghost' && hash && toIssuer) { const b = bat(hash); if (b.aNid == null) { b.aNid = f[1]; b.ghostNid = f[2]; b.ghost = true; } }
               else if (kind === 'accept' && f[1] && toIssuer) { const b = bat(f[1]); if (b.bNid == null) b.bNid = f[2]; }
               else if (kind === 'result' && f[1] && byIssuer) { const b = bat(f[1]); if (b.winnerNid == null) { b.winnerNid = f[2]; b.resultLseq = lseq; } }
             } catch { /* skip malformed memo */ }
@@ -1205,7 +1369,11 @@ app.get('/leaderboard', async (req, res) => {
       const row = nid => { let p = P.get(nid); if (!p) { p = { nid, played: 0, ladderPlayed: 0, pvpPlayed: 0, wins: 0, losses: 0,
         draws: 0, voids: 0, currentStreak: 0, bestStreak: 0, highestRungBeaten: -1, lastLedger: null, lastWin: null }; P.set(nid, p); } return p; };
       for (const b of settled) {
-        const pvp = !b.ladder && b.bNid;
+        // A ghost fight is one-sided by design: only the challenger's record moves. The ghost's
+        // owner never signed anything, so crediting them — win OR loss — would be conscripting a
+        // stranger's pet into a fight it never agreed to, which is the exact thing pickAccept was
+        // written to prevent on the PvP path.
+        const pvp = !b.ladder && !b.ghost && b.bNid;
         // If the recorded winner is neither side, the accept this scan picked is not the accept the
         // settlement used (anyone can send an accept memo, and a griefer's can land first). Credit
         // nobody rather than credit the wrong pet.
@@ -1460,6 +1628,12 @@ function noteLadderChallenge(tx, hash, lseq) {
         if (!hash) continue;
         const N = Number(f[3]);
         if (Number.isInteger(N)) pendingLadder.set(hash, N);
+      } else if (f[0] === 'ghost') {
+        // Ghost fights ride the ladder poller: one commitment, seed derived from the landing ledger.
+        // The gate is stored as the real seed ledger rather than the memo's margin, so the poller
+        // waits for the right ledger instead of relying on the resolver to keep erroring.
+        if (!hash || !Number.isInteger(Number(lseq))) continue;
+        pendingLadder.set(hash, Number(lseq) + BATTLE_LEDGER_MARGIN);
       } else if (f[0] === 'accept') {
         // separate map on purpose: a ladder battleId keys its own pinned N, a PvP one keys a seed
         // ledger derived from where the ACCEPT landed.
