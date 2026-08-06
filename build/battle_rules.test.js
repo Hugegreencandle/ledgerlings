@@ -18,7 +18,18 @@ function oracle(seed, A, B, a, b) {
     const r = s.care_max > 0 ? Math.max(0, Math.min(1, s.care / s.care_max)) : 0;
     return 100 + Math.round(r * 40) + Math.min(4, s.form || 0) * 10 + Math.min(4, s.stage || 0) * 8;
   };
-  const roll = nid => { let h = 0x811c9dc5 >>> 0; const t = seed + ':' + nid; for (let i = 0; i < t.length; i++) { h ^= t.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; } return (h >>> 0) % 1000; };
+  // v3 roll, reimplemented rather than imported so this stays a genuinely independent check:
+  // nid FIRST (so the bytes that differ between two pets get the full mixing chain), then a
+  // murmur3 fmix32 avalanche.
+  const roll = nid => {
+    let h = 0x811c9dc5 >>> 0; const t = nid + ':' + seed;
+    for (let i = 0; i < t.length; i++) { h ^= t.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; }
+    h >>>= 0;
+    h ^= h >>> 16; h = Math.imul(h, 0x7feb352d) >>> 0;
+    h ^= h >>> 15; h = Math.imul(h, 0x846ca68b) >>> 0;
+    h ^= h >>> 16;
+    return (h >>> 0) % 1000;
+  };
   const sA = A.alive !== 0 ? roll(a) + P(A) : -1, sB = B.alive !== 0 ? roll(b) + P(B) : -1;
   let w; if (sA < 0 && sB < 0) w = null; else if (sA > sB) w = a; else if (sB > sA) w = b; else w = a < b ? a : b;
   return { winner: w, scoreA: sA, scoreB: sB };
@@ -69,6 +80,36 @@ console.log('T5 — forfeit + draw + tiebreak');
   const f = BR.resolveBattle('sym', strong, weak, 'X', 'Y').winner;
   const g = BR.resolveBattle('sym', weak, strong, 'Y', 'X').winner;
   ok(f === g, `side-swap invariant: winner id stable (${f} === ${g})`);
+}
+
+console.log('T6 — v2 is FROZEN: recorded battles must keep re-deriving under the rules they were settled with');
+{
+  // Hard-coded from the pre-v3 implementation. If this ever fails, a "fix" has rewritten attested
+  // history and every v2 battle on mainnet would start reporting DIVERGED in the public verifier.
+  const v2roll = (seed, nid) => { let h = 0x811c9dc5 >>> 0; const t = seed + ':' + nid; for (let i = 0; i < t.length; i++) { h ^= t.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; } return (h >>> 0) % 1000; };
+  let drift = 0;
+  for (let i = 0; i < 500; i++) {
+    const s = 'frozen#' + i;
+    if (BR.rollForV2(s, 'petA') !== v2roll(s, 'petA')) drift++;
+    const got = BR.resolveBattle(s, strong, weak, 'petA', 'petB', 'v2');
+    const sA = v2roll(s, 'petA') + 212, sB = v2roll(s, 'petB') + 108;
+    if (got.scoreA !== sA || got.scoreB !== sB) drift++;
+  }
+  ok(drift === 0, `v2 re-derivation unchanged over 500 seeds (drift ${drift})`);
+  ok(BR.resolveBattle('x', strong, weak, 'A', 'B').rulesetVersion === 'v3', 'new battles default to v3');
+}
+
+console.log('T7 — v3 fixes the sibling-nid correlation that made care worthless');
+{
+  // Real XRPL NFTokenIDs from one issuer+taxon differ only in their low sequence bits.
+  const P = '00080000C1C0DE5C1E9A0FE0A5E2B8C4D6F81234064DD4';
+  const a = P + '30', b = P + '33';
+  const seen = new Set();
+  for (let i = 0; i < 20000; i++) { const s = 'sib#' + i; seen.add(BR.rollForV3(s, a) - BR.rollForV3(s, b)); }
+  ok(seen.size > 1000, `v3 roll difference takes ${seen.size} distinct values (v2 gave as few as 8)`);
+  const seenV2 = new Set();
+  for (let i = 0; i < 20000; i++) { const s = 'sib#' + i; seenV2.add(BR.rollForV2(s, a) - BR.rollForV2(s, b)); }
+  ok(seenV2.size < 100, `v2 really was quantised (${seenV2.size} distinct) — this is what v3 fixes`);
 }
 
 console.log(fails ? `\n${fails} FAILED` : '\nALL PASS');

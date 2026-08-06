@@ -135,6 +135,29 @@
     <div id="lMsg" style="margin-top:7px;font-size:12px;opacity:.85"></div>
   </div>
 
+  <!-- Fight Club. Pet vs pet: a challenge is a 1-drop Payment whose tx hash IS the battle id, so
+       sharing that id is the whole invite mechanic — no lobby, no server-side matchmaking, nothing
+       held in this browser. Same fairness claim as the ladder: the seed is the hash of a ledger that
+       has not closed yet at the moment the SECOND pet commits, so neither side can know the result.
+       The board below is derived from the ledger's own battle memos, never from local state. -->
+  <div id="fightBox" style="display:none;margin-top:10px;padding:11px;border:1px solid var(--glow);border-radius:10px;background:#0e3a4a;text-align:left">
+    <div style="color:var(--hot);margin-bottom:6px">🥊 Fight Club — pet vs pet</div>
+    <div style="opacity:.72;font-size:12px;margin-bottom:8px">Start a fight and share the battle id, or paste one somebody sent you. Free — 1 drop from each side, settled on the ledger. The dice are the hash of a ledger that has not closed yet when the second pet commits, so nobody can know or rig the result.</div>
+    <button id="fightNew" style="width:100%;padding:8px;border-radius:8px;border:1px solid var(--glow);background:#12586b;color:#dff;font:inherit;font-size:12px;cursor:pointer;text-align:left">⚔️ <b style="color:var(--hot)">Start a fight</b> <span style="opacity:.6">— get a battle id to share</span></button>
+    <div id="fightIdRow" style="display:none;margin-top:6px;padding:7px;border-radius:8px;border:1px dashed var(--glow);background:#062430">
+      <div style="opacity:.6;font-size:11px;margin-bottom:3px">your battle id — send this to your opponent</div>
+      <div id="fightId" style="word-break:break-all;font-size:11px;color:#cfefff;line-height:1.35"></div>
+      <button id="fightCopy" style="margin-top:6px;padding:6px 10px;border-radius:8px;border:1px solid var(--glow);background:#0e3a4a;color:var(--hot);cursor:pointer;font:inherit;font-size:12px">copy</button>
+    </div>
+    <input id="fightCode" placeholder="paste a battle id" autocomplete="off" spellcheck="false"
+      style="width:100%;box-sizing:border-box;margin-top:6px;padding:8px;border-radius:8px;border:1px solid var(--glow);background:#062430;color:#cfefff;font:inherit;font-size:13px">
+    <button id="fightGo" style="margin-top:6px;width:100%;padding:8px;border-radius:8px;border:1px solid var(--glow);background:#12586b;color:#dff;font:inherit;font-size:12px;cursor:pointer;font-weight:bold">Accept</button>
+    <div id="fMsg" style="margin-top:7px;font-size:12px;opacity:.85"></div>
+    <div style="margin-top:11px;color:var(--hot);font-size:12px">🏆 Fight board</div>
+    <div id="boardList" style="display:grid;gap:6px;margin-top:6px"></div>
+    <div id="boardNote" style="opacity:.6;font-size:11px;margin-top:6px"></div>
+  </div>
+
   <div id="verify">🔎 Verify my pet — prove the game played fair</div>
   <div id="share" style="margin-top:8px;padding:9px;border:1px solid var(--glow);border-radius:10px;background:#0e3a4a;color:var(--hot);cursor:pointer;display:none">🔗 Share my Ledgerling</div>
   <div id="foot">on XRPL · pet = a Dynamic NFT · every rule is open &amp; re-checkable</div>
@@ -799,6 +822,26 @@ C.addEventListener('pointerdown', e => {
   }
 });
 
+// ── Fight Club state. Declared ABOVE tick() on principle, exactly like the sign-modal constants at
+// the top of this file: a top-level let/const placed BELOW the render loop is still in the temporal
+// dead zone on frame one, and on 2026-08-05 that threw a ReferenceError, aborted the rest of the
+// script and blanked the live site for three hours. Nothing here is ever persisted — fightBattleId
+// lives for the lifetime of the tab, and the fight itself lives on the ledger.
+let fightBattleId=null;                 // battleId this client created or accepted (in memory only)
+let fightRole=null;                     // 'A' = challenger · 'B' = acceptor · null
+let fightExpiry=null;                   // absolute ledger this challenge stays acceptable until
+let BOARD=[];                           // last /leaderboard rows, for render only
+const FIGHT_POLL_MS=6000,               // one poll per ~1.5 ledgers
+      FIGHT_POLL_A_MAX=600,             // challenger: ~60 min, a human has to accept first
+      FIGHT_POLL_B_MAX=40,              // acceptor: ~4 min, settlement is already pinned
+      // Every GET /battle/:id is a full pass over the issuer's transaction history, and that cost grows
+      // with total game history because every interaction in this game is a Payment to the same issuer.
+      // Ticking 600 times meant 600 of those for ONE unaccepted challenge. The first two minutes are
+      // when a fast accept actually happens, so poll hard there and then drop to one call per ~24s:
+      // same 60-minute window, ~165 requests instead of 600.
+      FIGHT_POLL_FAST=20,               // ticks at full rate before backing off
+      FIGHT_POLL_SLOW_EVERY=4;          // after that, fetch on one tick in four
+
 let lastJoy=-1e9;
 function tick(){
   requestAnimationFrame(tick);
@@ -1153,8 +1196,12 @@ async function refreshRank(){
     // They read battle history and draw on top; they never touch pet state, so they cannot make
     // /verify diverge. A pet that lost a fight recently looks like it lost a fight recently.
     if(j){ lastFightLedger = j.lastLedger; lastFightWin = j.lastWin; }
+    // Field names must match what /ladder-rank actually returns: currentStreak and highestRungBeaten.
+    // This read j.streak and j.highestRung, neither of which exists on that response, so the line
+    // rendered "streak 0 · best rung -" for every pet no matter its record. highestRungBeaten is -1
+    // for "never beaten a rung", hence the >=0 guard rather than a null check.
     if(j && (j.wins!=null))
-      document.getElementById('lMsg').textContent=`your record: ${j.wins} win(s) · streak ${j.streak||0} · best rung ${j.highestRung!=null?j.highestRung:'-'}`;
+      document.getElementById('lMsg').textContent=`your record: ${j.wins} win(s) · streak ${j.currentStreak||0} · best rung ${(j.highestRungBeaten!=null&&j.highestRungBeaten>=0)?j.highestRungBeaten:'-'}`;
   }catch{ /* rank is cosmetic */ }
 }
 async function challengeRung(rung,name){
@@ -1172,24 +1219,54 @@ async function challengeRung(rung,name){
 }
 
 // Poll for the result memo the issuer writes once the pinned ledger closes.
-function watchBattle(battleId){
+// msgEl / maxTries let Fight Club reuse this untouched: a PvP challenger has to wait for a HUMAN to
+// accept, so its window is minutes not seconds, and its status belongs in the Fight Club panel. The
+// defaults keep the ladder call site (watchBattle(txid)) behaving exactly as before.
+function watchBattle(battleId, msgEl, maxTries){
   if(!battleId) return;
-  const msg=document.getElementById('lMsg');
-  let tries=0;
+  const msg=msgEl||document.getElementById('lMsg');
+  const cap=maxTries||40;
+  let tries=0, lastStatus=null, saidLive=false;
   const t=setInterval(async ()=>{
-    if(++tries>40){ clearInterval(t); return; }
+    if(++tries>cap){
+      clearInterval(t);
+      // Never fabricate a result. The fight settles on the ledger whether or not this tab is open.
+      msg.textContent = (lastStatus==='OPEN' && fightExpiry)
+        ? 'nobody accepted before ledger '+fightExpiry+'. Start another.'
+        : 'still waiting — reopen this page later, the result is on the ledger either way';
+      return;
+    }
+    // back off after the first two minutes (see FIGHT_POLL_FAST) — the timer keeps its 60-minute
+    // window, it just stops asking the backend for a full history scan every six seconds.
+    if(tries>FIGHT_POLL_FAST && (tries%FIGHT_POLL_SLOW_EVERY)) return;
     try{
       const b=await (await fetch(BK()+'/battle/'+battleId)).json();
-      if(b && b.result){
+      if(!b) return;
+      if(b.status) lastStatus=b.status;
+      if(b.status==='LIVE' && !b.result && !saidLive){
+        saidLive=true; msg.textContent='opponent accepted — settling in about a minute';
+      }
+      if(b.result){
         clearInterval(t);
-        const won=b.result.winnerNid===petNid;
-        triggerActionAnim('battle', { win: won });
-        msg.textContent=won?'you won that one 🏆':(b.result.winnerNid==='DRAW'?'a draw':'you lost that one');
-        toast(won?'ladder win 🏆':'ladder result in');
-        refreshRank(); pullLive();
+        const wn=b.result.winnerNid;
+        if(wn==='VOID'){
+          // stake underpaid: the issuer refunded both sides. Not a loss, so nothing to animate.
+          msg.textContent='that fight was voided and refunded';
+          toast('fight voided');
+        } else if(wn==='DRAW'){
+          msg.textContent='a draw';
+          toast('a draw');
+        } else {
+          const won=wn===petNid;
+          triggerActionAnim('battle', { win: won });
+          msg.textContent=won?'you won that one 🏆':'you lost that one';
+          toast(won?'battle win 🏆':'battle result in');
+        }
+        noteFairness(battleId, msg);
+        refreshRank(); pullLive(); loadBoard();
       }
     }catch{ /* keep waiting */ }
-  },6000);
+  },FIGHT_POLL_MS);
 }
 
 // A Ledgerlings interaction is an ordinary Payment. The issuer's poller reads it out of ledger
@@ -1234,6 +1311,13 @@ function setMode(){
         document.getElementById('keyless').style.display='block';
         document.getElementById('share').style.display='none';
         document.getElementById('ladderBox').style.display='none';
+        fightBattleId=null; fightRole=null; fightExpiry=null;
+        // The fight board is PUBLIC — a visitor with no pet at all sees it on page load. Hiding it
+        // here left it hidden for the rest of the tab's life, since nothing after sign-out ever calls
+        // loadBoard() again. Reload it instead: it re-shows the box and syncFightControls() greys the
+        // action buttons off petNid, which is now null. syncFightControls() is also called directly:
+        // loadBoard() early-returns on a fetch failure and the controls must grey out regardless.
+        syncFightControls(); loadBoard();
         setMode(); refreshOps(); toast('account cleared');
       };
     }
@@ -1243,6 +1327,171 @@ function setMode(){
 // Poll the backend for authoritative state. The issuer's poller reconciles each pet to
 // replay(history), so this is the state the verifier checks, not a local guess.
 async function pullLive(){ if(!petNid) return; const live=await XamanBridge.fetchPet(petNid); if(live){ pet=live; refreshOps(); } }
+
+// ── Fight Club (pet vs pet) ──────────────────────────────────────────────────────────────────────
+// Placed AFTER the BK() declaration on purpose: initFightClub() runs at the bottom of this block as
+// a top-level statement, and a const read before its initialiser is a TDZ throw.
+//
+// There is exactly ONE signing path in this app: signRequest() -> watchSign(). Fight Club adds no
+// second one. It also writes NO pet state anywhere: fightBattleId is a tab-lifetime variable, every
+// status line comes from GET /battle/:id, and the board comes from GET /leaderboard, both of which
+// are projections of the issuer's own ledger history.
+
+// Same asleep guard as runOp() and the dance button: a demo pet has no on-ledger identity to fight with.
+function fightAwake(){
+  if(petNid) return true;
+  toast('😴 Pet is asleep! Sign in to wake it up 🔒');
+  const k=document.getElementById('keyless'); if(k) k.scrollIntoView({ behavior: 'smooth' });
+  return false;
+}
+
+// Action controls need a live pet; the board does not, and renders for anyone who loads the page.
+function syncFightControls(){
+  const on=!!petNid;
+  ['fightNew','fightCode','fightGo'].forEach(id=>{
+    const el=document.getElementById(id);
+    if(!el) return;
+    el.disabled=!on;
+    el.style.opacity=on?'1':'.45';
+    el.style.cursor=on?'pointer':'default';
+  });
+}
+
+// Flow A: create a challenge, surface the battle id to share.
+// Deliberately no optimistic animation here — challengeRung() plays a WIN before the dice exist,
+// which is exactly the kind of thing this project cannot afford to show. Fight Club animates only
+// from the real on-ledger result, inside watchBattle().
+async function startFight(){
+  if(!fightAwake()) return;
+  const j=await signRequest(
+    {kind:'challenge', owner:OWNER, nid:petNid},
+    'Start a fight',
+    `Approve a 1-drop challenge in Xaman. Share the battle id it produces — whoever accepts fights `+
+    `your pet. The dice are the hash of a ledger that has not closed yet when your opponent commits, `+
+    `so nobody can know or rig the result.`);
+  if(!j) return;                       // signRequest leaves the error on screen in #lov; do not talk over it
+  fightExpiry = j.pinnedLedger || null;
+  watchSign(j.uuid, txid=>{
+    if(!txid) return;
+    fightBattleId=txid; fightRole='A';
+    document.getElementById('fightIdRow').style.display='block';
+    document.getElementById('fightId').textContent=txid;
+    document.getElementById('fMsg').textContent=
+      'share this battle id.'+(fightExpiry?(' Open until ledger '+fightExpiry+'.'):'');
+    watchBattle(txid, document.getElementById('fMsg'), FIGHT_POLL_A_MAX);
+  }, {ws:j.ws});
+}
+
+// Flow B: accept a pasted battle id.
+async function acceptFight(){
+  if(!fightAwake()) return;
+  const fm=document.getElementById('fMsg');
+  const id=(document.getElementById('fightCode').value||'').trim().toUpperCase();
+  if(!/^[0-9A-F]{64}$/.test(id)){ toast('that is not a battle id'); return; }
+  // Read the fight off the ledger BEFORE asking for a signature — same instinct as opReady() in
+  // runOp(): never spend a signature on something that cannot succeed. The backend re-checks all of
+  // this itself; this only turns a modal full of error text into one plain line.
+  fm.textContent='checking that fight…';
+  let b=null; try{ b=await (await fetch(BK()+'/battle/'+id)).json(); }catch{ b=null; }
+  if(b && !b.error){
+    const nl=nowL();
+    if(b.status==='NOT_FOUND'||!b.challenge){ fm.textContent='no fight with that id — check the code'; return; }
+    if(b.challenge.npc){ fm.textContent='that is a ladder battle, not a PvP challenge'; return; }
+    if(b.result){ fm.textContent='that fight is already settled'; return; }
+    if(b.accept){ fm.textContent='someone already took that fight'; return; }
+    if(b.challenge.aNid===petNid){ fm.textContent='a pet cannot battle itself'; return; }
+    if(nl!=null && Number.isInteger(b.challenge.N) && nl>=b.challenge.N){ fm.textContent='that challenge has expired'; return; }
+  }
+  fm.textContent='';
+  const j=await signRequest(
+    {kind:'accept', owner:OWNER, nid:petNid, battleId:id},
+    'Accept the fight',
+    `Approve a 1-drop Payment in Xaman. The dice are the hash of a ledger that has not closed yet `+
+    `when you accept, so neither side can know the result in advance.`);
+  if(!j) return;
+  // The accept's OWN txid is not the battle id — the battle id is the challenge's hash. Poll `id`.
+  watchSign(j.uuid, ()=>{
+    fightBattleId=id; fightRole='B';
+    fm.textContent='accepted — settling once the pinned ledger closes, about a minute.';
+    watchBattle(id, fm, FIGHT_POLL_B_MAX);
+  }, {ws:j.ws});
+}
+
+function selectFightId(){
+  try{
+    const el=document.getElementById('fightId'), r=document.createRange();
+    r.selectNodeContents(el);
+    const s=window.getSelection(); s.removeAllRanges(); s.addRange(r);
+  }catch{}
+  toast('select and copy the id');
+}
+function copyFightId(){
+  const el=document.getElementById('fightId');
+  const id=fightBattleId||(el&&el.textContent)||'';
+  if(!id) return;
+  if(navigator.clipboard && navigator.clipboard.writeText){
+    try{ navigator.clipboard.writeText(id).then(()=>toast('battle id copied'), selectFightId); }
+    catch{ selectFightId(); }
+  } else selectFightId();
+}
+
+// A late-landing accept trips STALE_COMMITMENT on the verifier. It means "accepted after the
+// challenge expired", NOT "the seed was public" — the seed still came from a ledger that had not
+// closed when the acceptor signed. Rendered as an advisory line, never as a failure.
+async function noteFairness(battleId, msg){
+  if(!BK()||!msg) return;
+  try{
+    const v=await (await fetch(BK()+'/verify-battle/'+battleId)).json();
+    if(v && v.warning==='STALE_COMMITMENT')
+      msg.textContent += ' · accepted after the challenge expired — the result is still fair, the seed came from a ledger that had not closed at accept time';
+  }catch{ /* advisory only */ }
+}
+
+// The board is a projection of the issuer's battle memos. It is cosmetic: it must never block or
+// break the app, so every failure path just leaves whatever was there before.
+async function loadBoard(){
+  if(!BK()) return;
+  let j=null;
+  try{ j=await (await fetch(BK()+'/leaderboard?limit=25')).json(); }catch{ return; }
+  if(!j||j.error||!Array.isArray(j.rows)) return;
+  BOARD=j.rows;
+  const list=document.getElementById('boardList'); if(!list) return;
+  list.innerHTML='';
+  if(!BOARD.length){
+    const d=document.createElement('div');
+    d.style.cssText='opacity:.6;font-size:11px';
+    d.textContent='no fights settled yet — be the first.';
+    list.appendChild(d);
+  }
+  BOARD.forEach((r,i)=>{
+    const mine = r.nid && r.nid===petNid;
+    const rung = (r.highestRungBeaten!=null && r.highestRungBeaten>=0) ? r.highestRungBeaten : '-';
+    const d=document.createElement('div');
+    d.style.cssText='padding:7px 8px;border-radius:8px;border:1px solid '+(mine?'var(--hot)':'var(--glow)')+
+      ';background:'+(mine?'#12586b':'#062430')+';font-size:12px;color:#dff';
+    d.innerHTML=
+      `<b style="color:var(--hot)">#${i+1}</b> <span style="opacity:.85">${String(r.nid||'').slice(-8)}</span>`+
+      (mine?' <span style="opacity:.7">← yours</span>':'')+'<br>'+
+      `<span style="opacity:.7;font-size:11px">${r.wins||0}W-${r.losses||0}L-${r.draws||0}D · `+
+      `streak ${r.currentStreak||0} (best ${r.bestStreak||0}) · best rung ${rung}`+
+      (r.winRate!=null?` · win rate ${r.winRate}%`:'')+`</span>`;
+    list.appendChild(d);
+  });
+  const note=document.getElementById('boardNote'); if(note) note.textContent=j.note||'';
+  const box=document.getElementById('fightBox'); if(box) box.style.display='block';
+  syncFightControls();
+}
+
+function initFightClub(){
+  const box=document.getElementById('fightBox'); if(!box) return;
+  document.getElementById('fightNew').onclick=startFight;
+  document.getElementById('fightGo').onclick=acceptFight;
+  document.getElementById('fightCopy').onclick=copyFightId;
+  document.getElementById('fightCode').addEventListener('keydown',e=>{ if(e.key==='Enter') acceptFight(); });
+  syncFightControls();
+  if(BK()){ box.style.display='block'; loadBoard(); }   // the board is public: no pet required
+}
+initFightClub();
 
 // Keyless adopt. POST /adopt is public and takes any classic address, so a visitor with no wallet
 // software still gets a real, source-tagged, mainnet mint. This is the same endpoint that passed
@@ -1265,7 +1514,7 @@ async function keylessAdopt(addr, isAutoLoad){
   document.getElementById('keyless').style.display='none';
   await syncLedger(); setInterval(syncLedger,30000);
   setInterval(pullLive,15000);
-  showShare(); setMode(); refreshOps(); loadLadder();
+  showShare(); setMode(); refreshOps(); loadLadder(); loadBoard();
   toast(isAutoLoad?'welcome back 💖':'adopted on mainnet 🎉');
 }
 
@@ -1280,7 +1529,7 @@ async function keylessAdopt(addr, isAutoLoad){
     }
     toast('connected: '+OWNER.slice(0,8)+'…');
     await syncLedger(); setInterval(syncLedger,30000);     // real ledger for cooldown gray-out
-    showShare(); loadLadder();
+    showShare(); loadLadder(); loadBoard();
   } else if(BK()){
     let savedOwner=null;
     try{ savedOwner=localStorage.getItem('ll_owner'); }catch{}

@@ -46,7 +46,13 @@ const CHARACTER_TAXON = 7779;
 const ACHIEVEMENT_TAXON = 7780;
 // Ruleset version stamped into each badge so it can't be validated against a swapped ruleset.
 // Production = the anchored open-rules hash; MVP default 'v1'.
-const RULESET_VERSION = String(process.env.RULESET_VERSION || 'v2').slice(0, 12);   // v2: egg hatches in-session
+// v2: egg hatches in-session. v3 (2026-08-06): battle roll is keyed nid-first with an avalanche
+// finalizer — under v2 the roll was fnv1a(seed+':'+nid), and because sibling pet NFTokenIDs differ
+// only in their low sequence bits, both pets' rolls came from a near-identical hash state. Care was
+// worth nothing in some matchups and nearly decisive in others. See build/battle_rules.js.
+// NOTE: this is the DEFAULT only. If RULESET_VERSION is set in the deploy environment it wins, so
+// bumping this line does not change production on its own.
+const RULESET_VERSION = String(process.env.RULESET_VERSION || 'v3').slice(0, 12);
 // Auto-mint newly-earned badges inside /interact (more live on-chain txns for the demo). Default ON; AUTO_AWARD=0 disables.
 const AUTO_AWARD = process.env.AUTO_AWARD !== '0';
 // Battles (Make Waves #10): provably-fair pet duels. Soulbound "battle card" record NFT; own taxon.
@@ -57,6 +63,11 @@ const BATTLE_FEE_BPS = Number(process.env.BATTLE_FEE_BPS || 500);        // plat
 // roughly 80 seconds: long enough that the seed cannot be known at commitment, short enough that a
 // player is not left waiting. Counted from the CHALLENGE's ledger, not from when the payload was built.
 const BATTLE_LEDGER_MARGIN = Number(process.env.BATTLE_LEDGER_MARGIN || 20);
+// Fight Club (PvP via /sign): how long a challenge stays acceptable, in ledgers (~4s each, so 900 ≈ 60 min).
+// This is an EXPIRY written as an ABSOLUTE ledger index into memo field 4, not a seed commitment: the seed
+// ledger is always derived at resolution from the ACCEPT's landing ledger (+ BATTLE_LEDGER_MARGIN), so the
+// dice are unknowable at the moment of the last commitment no matter what this value is.
+const BATTLE_CHALLENGE_TTL = Number(process.env.BATTLE_CHALLENGE_TTL || 900);   // ledgers (~60 min)
 const BATTLE_MEMO = 'ledgerlings/battle';
 // House ladder: PUBLISHED NPC opponents (open stat blocks, versioned). Because the opponent's stats are public
 // + fixed, a ladder battle is as provably-fair as PvP — the seed is still the pinned ledger hash and
@@ -121,6 +132,22 @@ async function withClient(fn) {
     if (ISSUER_ADDRESS) w.classicAddress = ISSUER_ADDRESS;
     return await fn(c, w);
   } finally { await c.disconnect(); }
+}
+// Tiny in-process TTL cache for the PUBLIC read endpoints only.
+//
+// Every one of them (loadBattle, /leaderboard) paginates the issuer's ENTIRE account_tx history, over a
+// fresh WebSocket connection per request, and the client polls an open fight for up to an hour. Cost
+// per call also grows with total game history, because every pet interaction is a Payment to the same
+// issuer — it gets more expensive exactly as the game succeeds. NOTHING that settles or verifies a
+// battle reads this: resolveBattleTx and verifyBattle always go to the ledger.
+const _cache = new Map();
+async function cached(key, ttlMs, fn) {
+  const hit = _cache.get(key);
+  if (hit && Date.now() - hit.at < ttlMs) return hit.val;
+  const val = await fn();
+  if (_cache.size > 500) _cache.clear();          // crude bound; these are all cheap to rebuild
+  _cache.set(key, { at: Date.now(), val });
+  return val;
 }
 async function readState(c, issuer, nid) {
   const r = await c.request({ command: 'account_nfts', account: issuer });
@@ -431,30 +458,93 @@ async function ledgerHashOf(c, N) {
   const r = await c.request({ command: 'ledger', ledger_index: Number(N) });
   return (r.result.ledger && r.result.ledger.ledger_hash) || r.result.ledger_hash || null;
 }
-// a battle lives entirely in three memo'd Payments on the issuer: challenge (tx hash = battleId), accept, result.
+// a battle lives entirely in memo'd Payments on the issuer: challenge (tx hash = battleId), accept(s),
+// refund legs, result.
+//
+// EVERY memo here is attacker-writable. The format is public, and a 1-drop Payment to the issuer
+// carrying one needs none of our endpoints — so the guards in the payload BUILDERS (/battle/accept,
+// /sign) are advice to honest clients, not enforcement. This parser is where authority is decided:
+//
+//   · SETTLEMENT IS ISSUER-ONLY. A `result` or `refund` memo counts only when the ISSUER signed it
+//     (tx.Account === issuer). Anyone could otherwise send a forged `result|<battleId>|…` and freeze
+//     the pot behind the ALREADY_RESOLVED short-circuit — the winner never paid — while flipping the
+//     public /verify-battle to FAIL on a fight that was in fact fair.
+//   · COMMITMENTS MUST BE DELIVERED TO THE ISSUER (tx.Destination === issuer): the Payment IS the stake.
+//   · FIRST COMMITMENT WINS. Accepts are collected in ledger order and a later one is INERT. Under
+//     last-write-wins the seed ledger (accept.lseq + margin) moved with every new accept memo, so a
+//     party who read the outcome after ledger N closed could re-roll the dice for a drop, repeatedly,
+//     and could also swap b.accept.ownerB — the VOID branch refunds THAT address — to walk off with
+//     the honest acceptor's stake. Both die here.
+//   · tec IS NOT SUCCESS. A tec'd Payment is recorded in the ledger with its memos intact but moves
+//     nothing. Counting one as a commitment, a refund or a settlement is how a battle became
+//     permanently ALREADY_RESOLVED with the money still sitting at the issuer.
 async function loadBattle(c, issuer, battleId) {
-  const out = { battleId, challenge: null, accept: null, result: null };
+  const out = { battleId, challenge: null, accept: null, accepts: [], refunds: {}, result: null };
   let marker;   // full pagination (no count cap) — battles are low-frequency; correctness over a bounded scan
   do {
     const r = await c.request({ command: 'account_tx', account: issuer, limit: 200, forward: true, marker });
     for (const t of r.result.transactions) {
       const tx = t.tx || t.tx_json || {}; if (tx.TransactionType !== 'Payment') continue;
+      if (!t.meta || t.meta.TransactionResult !== 'tesSUCCESS') continue;   // tec'd: in the ledger, moved nothing
       const hash = tx.hash || t.hash || ''; const lseq = tx.ledger_index || t.ledger_index;
+      const toIssuer = tx.Destination === issuer, byIssuer = tx.Account === issuer;
       for (const m of (tx.Memos || [])) {
         const md = m.Memo || {};
         try {
           if (unhex(md.MemoType || '') !== BATTLE_MEMO) continue;
           const f = unhex(md.MemoData || '').split('|'), kind = f[0];
-          if (kind === 'challenge' && hash === battleId) out.challenge = { aNid: f[1], stakeDrops: f[2], N: Number(f[3]), ownerA: tx.Account, delivered: (t.meta && t.meta.delivered_amount) || tx.Amount, lseq };
-          else if (kind === 'ladder' && hash === battleId) out.challenge = { aNid: f[1], rung: Number(f[2]), N: Number(f[3]), ownerA: tx.Account, npc: true, lseq };
-          else if (kind === 'accept' && f[1] === battleId) out.accept = { bNid: f[2], ownerB: tx.Account, delivered: (t.meta && t.meta.delivered_amount) || tx.Amount, lseq };
-          else if (kind === 'result' && f[1] === battleId) out.result = { winnerNid: f[2], scoreA: Number(f[3]), scoreB: Number(f[4]), rv: f[5], dest: tx.Destination, lseq };
+          if (kind === 'challenge' && hash === battleId && toIssuer && !out.challenge) out.challenge = { aNid: f[1], stakeDrops: f[2], N: Number(f[3]), ownerA: tx.Account, delivered: (t.meta && t.meta.delivered_amount) || tx.Amount, lseq };
+          else if (kind === 'ladder' && hash === battleId && toIssuer && !out.challenge) out.challenge = { aNid: f[1], rung: Number(f[2]), N: Number(f[3]), ownerA: tx.Account, npc: true, lseq };
+          else if (kind === 'accept' && f[1] === battleId && toIssuer) out.accepts.push({ bNid: f[2], ownerB: tx.Account, delivered: (t.meta && t.meta.delivered_amount) || tx.Amount, lseq, hash });
+          else if (kind === 'result' && f[1] === battleId && byIssuer && !out.result) out.result = { winnerNid: f[2], scoreA: Number(f[3]), scoreB: Number(f[4]), rv: f[5], dest: tx.Destination, lseq };
+          else if (kind === 'refund' && f[1] === battleId && byIssuer && (f[2] === 'A' || f[2] === 'B')) out.refunds[f[2]] = { dest: tx.Destination, drops: (t.meta && t.meta.delivered_amount) || tx.Amount, lseq };
         } catch { /* skip malformed memo */ }
       }
     }
     marker = r.result.marker;
   } while (marker);
+  out.accepts.sort((a, b) => (a.lseq - b.lseq) || (a.hash < b.hash ? -1 : a.hash > b.hash ? 1 : 0));
+  // Cheap, network-free pick: the first WELL-FORMED accept. pickAccept() below refines this with the
+  // ownership test (which costs a history read) and is what every money and verification path uses.
+  out.accept = out.accepts.find(a => acceptWellFormed(out.challenge, a)) || null;
   return out;
+}
+// Is this accept memo a real commitment to THIS challenge? Every test is a function of ledger data
+// alone — no server state — so /verify-battle reaches the same answer any third party does.
+function acceptWellFormed(ch, a) {
+  if (!ch || ch.npc) return false;                                          // a ladder battle has no second party
+  if (!a.bNid || a.bNid === ch.aNid) return false;                          // a pet cannot fight itself: identical
+                                                                            // state means scoreA === scoreB, the
+                                                                            // tiebreak hands nidA a certain win, and
+                                                                            // the board folded the one battle twice
+  if (Number(a.delivered || 0) < Number(ch.stakeDrops || 0)) return false;   // the stake has to actually arrive
+  // Field 4 of a PvP challenge memo is an ABSOLUTE expiry ledger (only the ladder branch writes the
+  // margin form there, and a ladder challenge never reaches here). An open-ended challenge is not just
+  // untidy: a pet that has PASSED forfeits (score -1), so an opponent could sit on a public battleId,
+  // wait for the challenger's pet to die of neglect, and then accept for a certain win.
+  //
+  // The cutoff carries one margin of grace. Both accept builders check the expiry against the CURRENT
+  // ledger and the signed transaction lands a ledger or two later, and POST /battle/challenge pins N
+  // only BATTLE_LEDGER_MARGIN ahead — so an exact cutoff would reject accepts our own endpoint had just
+  // told the player were in time, and strand the challenge with no refund path.
+  if (Number.isInteger(ch.N) && ch.N > 1000000 && Number(a.lseq) > ch.N + BATTLE_LEDGER_MARGIN) return false;
+  return true;
+}
+// The accept that decides the fight: the first well-formed one whose SENDER OWNS the pet it nominates.
+// Owner is read from that pet's replayed history at the accept's own ledger — fixed, public, and it
+// dodges the circularity of needing the seed ledger (which this choice determines) to make the choice.
+// Without it a griefer conscripts a stranger's pet into a fight it never agreed to, and the loss lands
+// on that pet's public record. Returns the loaded history so the caller does not pay for it twice.
+async function pickAccept(c, issuer, b) {
+  if (!b || !b.challenge || b.challenge.npc) return null;
+  for (const a of b.accepts) {
+    if (!acceptWellFormed(b.challenge, a)) continue;
+    const h = await loadHistory(c, issuer, a.bNid);
+    if (!h.genesis) continue;                                                     // nominated a pet that does not exist
+    if (stateAtLedger(h.genesis, h.interactions, a.lseq).owner !== a.ownerB) continue;   // not their pet
+    return { accept: a, history: h };
+  }
+  return null;
 }
 // resolve (admin, idempotent): re-derive the winner from the pinned ledger hash + open rules, pay the winner, mint a card.
 // ladder (vs a published house NPC): no accept, no wager. Free, provably fair, solo-climbable.
@@ -495,7 +585,10 @@ async function resolveLadder(c, w, battleId, b) {
   const d = BR.resolveBattle(seed, sA, npc.stats, aNid, npcId);
   const winnerNid = d.winner === null ? 'DRAW' : d.winner, playerWon = d.winner === aNid;
   const resultMemo = [{ Memo: { MemoType: hex(BATTLE_MEMO), MemoData: hex(['result', battleId, winnerNid, d.scoreA, d.scoreB, RULESET_VERSION].join('|')) } }];
-  await submit(c, w, { TransactionType: 'Payment', Account: issuer, Destination: ownerA, Amount: '1', Memos: resultMemo });   // 1-drop carries the result
+  const rr = await submit(c, w, { TransactionType: 'Payment', Account: issuer, Destination: ownerA, Amount: '1', Memos: resultMemo });   // 1-drop carries the result
+  // A tec'd payment is in the ledger with its memo intact but moved nothing, and loadBattle ignores it,
+  // so the battle stays unresolved. Say so rather than reporting a settlement that did not happen.
+  if (rr !== 'tesSUCCESS') return { error: 'result payment did not succeed', result: rr, battleId, ladder: true };
   let card;
   if (playerWon) { try {
     const cp = await c.autofill(tag({ TransactionType: 'NFTokenMint', Account: issuer, NFTokenTaxon: BATTLE_TAXON, Flags: 0,
@@ -509,13 +602,52 @@ async function resolveLadder(c, w, battleId, b) {
     card };
 }
 
+// Refund both sides, then write the settlement record LAST.
+//
+// The VOID and DRAW branches used to attach the result memo to the FIRST of two separate payments and
+// discard every TransactionResult. Once that first one validated the battle was ALREADY_RESOLVED
+// forever, so a tec on the second refund (a destination with lsfRequireDestTag or lsfDepositAuth, the
+// issuer short of reserve, or simply the process dying between the two submits) left the counterparty
+// permanently unpaid, reported as success, and never retried by the poller.
+//
+// Now each leg carries its own `refund|<battleId>|A|B` memo, so a leg that already landed is skipped on
+// a retry (per-leg idempotence — no double refund), and the `result` memo is only written once BOTH
+// legs are on the ledger. No result memo means the battle is still unresolved, which is exactly what a
+// retry needs to be safe.
+async function refundBoth(c, w, battleId, b, deliveredA, deliveredB, resultMemo) {
+  const issuer = w.classicAddress;
+  const legs = [];
+  if (deliveredA > 0 && !b.refunds.A) legs.push(['A', b.challenge.ownerA, deliveredA]);
+  if (deliveredB > 0 && !b.refunds.B) legs.push(['B', b.accept.ownerB, deliveredB]);
+  const refunds = { ...b.refunds }, failed = [];
+  for (const [leg, dest, drops] of legs) {
+    const rr = await submit(c, w, { TransactionType: 'Payment', Account: issuer, Destination: dest, Amount: String(Math.max(1, drops)),
+      Memos: [{ Memo: { MemoType: hex(BATTLE_MEMO), MemoData: hex(['refund', battleId, leg].join('|')) } }] });
+    if (rr === 'tesSUCCESS') refunds[leg] = { dest, drops: String(Math.max(1, drops)) };
+    else failed.push({ leg, dest, drops, result: rr });
+  }
+  if (failed.length) {
+    console.warn(`[battle] ${battleId.slice(0, 8)} refund leg(s) failed:`, JSON.stringify(failed));
+    return { error: 'refund did not succeed — battle left UNRESOLVED so it can be retried safely', failed, refunds };
+  }
+  // 1 drop to the challenger carries the record. Issuer-signed, so loadBattle will count it.
+  const rr = await submit(c, w, { TransactionType: 'Payment', Account: issuer, Destination: b.challenge.ownerA, Amount: '1', Memos: resultMemo });
+  if (rr !== 'tesSUCCESS') return { error: 'refunds landed but the result memo did not — retry is safe (legs are skipped)', failed: [{ leg: 'result', result: rr }], refunds };
+  return { refunds };
+}
+
 async function resolveBattleTx(c, w, battleId) {
   const issuer = w.classicAddress;
   const b = await loadBattle(c, issuer, battleId);
   if (!b.challenge) return { error: 'battle not found', battleId };
   if (b.result) return { status: 'ALREADY_RESOLVED', result: b.result };     // idempotent — never double-pay
   if (b.challenge.npc) return resolveLadder(c, w, battleId, b);               // ladder path (no accept/wager)
-  if (!b.accept) return { status: 'OPEN', error: 'not accepted yet' };
+  // The FIRST valid accept and nothing else. Later accept memos are inert (see loadBattle): the seed
+  // ledger is derived from this one, so a movable accept is a re-rollable dice.
+  const picked = await pickAccept(c, issuer, b);
+  if (!picked) return { status: 'OPEN', error: 'not accepted yet',
+    ...(b.accepts.length ? { ignoredAccepts: b.accepts.length, reason: 'accept memo(s) exist but none is a valid commitment (self-battle, unowned pet, underpaid stake or past the expiry)' } : {}) };
+  b.accept = picked.accept;
   const { aNid } = b.challenge, { bNid } = b.accept;
   // Seed ledger is derived from the ACCEPT's landing ledger, not from the challenge memo.
   //
@@ -535,7 +667,7 @@ async function resolveBattleTx(c, w, battleId) {
   const lh = await ledgerHashOf(c, N);
   if (!lh) return { error: 'pinned ledger not validated yet', N };
   const seed = seedFor(lh, battleId, aNid, bNid);
-  const hA = await loadHistory(c, issuer, aNid), hB = await loadHistory(c, issuer, bNid);
+  const hA = await loadHistory(c, issuer, aNid), hB = picked.history;   // pickAccept already read B's history
   if (!hA.genesis || !hB.genesis) return { error: 'a pet in this battle was not found' };
   const sA = stateAtLedger(hA.genesis, hA.interactions, N), sB = stateAtLedger(hB.genesis, hB.interactions, N);
   const d = BR.resolveBattle(seed, sA, sB, aNid, bNid);
@@ -544,26 +676,29 @@ async function resolveBattleTx(c, w, battleId) {
   // counterpart's real XRP by under-delivering their own stake.
   const stake = Number(b.challenge.stakeDrops || 0);
   const deliveredA = Number(b.challenge.delivered || 0), deliveredB = Number(b.accept.delivered || 0);
-  if (deliveredA < stake || deliveredB < stake) {
-    const voidMemo = [{ Memo: { MemoType: hex(BATTLE_MEMO), MemoData: hex(['result', battleId, 'VOID', 0, 0, RULESET_VERSION].join('|')) } }];
-    if (deliveredA > 0) await submit(c, w, { TransactionType: 'Payment', Account: issuer, Destination: b.challenge.ownerA, Amount: String(Math.max(1, deliveredA)), Memos: voidMemo });
-    if (deliveredB > 0) await submit(c, w, { TransactionType: 'Payment', Account: issuer, Destination: b.accept.ownerB, Amount: String(Math.max(1, deliveredB)) });
-    return { battleId, status: 'VOID', reason: 'stake underpaid — refunded actual amounts', stake, deliveredA, deliveredB };
-  }
   const winnerNid = d.winner === null ? 'DRAW' : d.winner;
   const pot = deliveredA + deliveredB;
   const fee = Math.floor(pot * BATTLE_FEE_BPS / 10000);
-  const resultMemo = [{ Memo: { MemoType: hex(BATTLE_MEMO), MemoData: hex(['result', battleId, winnerNid, d.scoreA, d.scoreB, RULESET_VERSION].join('|')) } }];
+  const memoFor = wn => [{ Memo: { MemoType: hex(BATTLE_MEMO), MemoData: hex(['result', battleId, wn,
+    wn === 'VOID' ? 0 : d.scoreA, wn === 'VOID' ? 0 : d.scoreB, RULESET_VERSION].join('|')) } }];
+  if (deliveredA < stake || deliveredB < stake) {
+    const r = await refundBoth(c, w, battleId, b, deliveredA, deliveredB, memoFor('VOID'));
+    if (r.error) return { battleId, status: 'REFUND_FAILED', ...r, stake, deliveredA, deliveredB };
+    return { battleId, status: 'VOID', reason: 'stake underpaid — refunded actual amounts', stake, deliveredA, deliveredB, refunds: r.refunds };
+  }
   let payout;
-  if (d.winner === null) {                                                    // draw → refund both, carry result memo
-    await submit(c, w, { TransactionType: 'Payment', Account: issuer, Destination: b.challenge.ownerA, Amount: '1', Memos: resultMemo });
-    if (deliveredA > 1) await submit(c, w, { TransactionType: 'Payment', Account: issuer, Destination: b.challenge.ownerA, Amount: String(deliveredA) });
-    if (deliveredB > 1) await submit(c, w, { TransactionType: 'Payment', Account: issuer, Destination: b.accept.ownerB, Amount: String(deliveredB) });
-    payout = { winner: 'DRAW', refunded: true };
+  if (d.winner === null) {                                                    // draw → refund both, then record
+    const r = await refundBoth(c, w, battleId, b, deliveredA, deliveredB, memoFor('DRAW'));
+    if (r.error) return { battleId, status: 'REFUND_FAILED', ...r, pot };
+    payout = { winner: 'DRAW', refunded: true, refunds: r.refunds };
   } else {
     const winnerOwner = d.winner === aNid ? sA.owner : sB.owner;
     const amount = String(Math.max(1, pot - fee));
-    const rr = await submit(c, w, { TransactionType: 'Payment', Account: issuer, Destination: winnerOwner, Amount: amount, Memos: resultMemo });
+    // The result memo rides the payout itself, so the settlement record and the money are one atomic
+    // transaction: if it fails there is no memo, the battle is not ALREADY_RESOLVED, and a retry pays
+    // exactly once. (loadBattle ignores non-tesSUCCESS, which is what makes that true.)
+    const rr = await submit(c, w, { TransactionType: 'Payment', Account: issuer, Destination: winnerOwner, Amount: amount, Memos: memoFor(winnerNid) });
+    if (rr !== 'tesSUCCESS') return { battleId, status: 'PAYOUT_FAILED', error: 'payout did not succeed', result: rr, winnerOwner, amount };
     payout = { winner: winnerNid, winnerOwner, paidDrops: amount, feeDrops: fee, result: rr };
   }
   let card;                                                                   // cosmetic soulbound "battle card" keepsake
@@ -596,7 +731,10 @@ async function verifyBattle(c, issuer, battleId) {
     const lh = await ledgerHashOf(c, N); if (!lh) return { ok: false, verdict: 'ERROR', reason: 'pinned ledger not available' };
     const npcId = 'NPC:' + npc.id, seed = seedFor(lh, battleId, aNid, npcId);
     const h = await loadHistory(c, issuer, aNid), sA = stateAtLedger(h.genesis, h.interactions, N);
-    const d = BR.resolveBattle(seed, sA, npc.stats, aNid, npcId), derivedWinner = d.winner === null ? 'DRAW' : d.winner;
+    // Re-derive under the ruleset the battle was RECORDED with, not today's. The rules are versioned
+    // precisely so a later fix cannot retroactively contradict a result the verifier already
+    // published; deriving a v2 battle under v3 would report DIVERGED on honest history.
+    const d = BR.resolveBattle(seed, sA, npc.stats, aNid, npcId, b.result.rv), derivedWinner = d.winner === null ? 'DRAW' : d.winner;
     const ok = derivedWinner === b.result.winnerNid && d.scoreA === b.result.scoreA && d.scoreB === b.result.scoreB;
     return { ok, verdict: ok ? 'PASS' : 'FAIL', battleId, ladder: true, opponent: npc.name,
       seedLedger: N, challengeLedger: lseq, claimedN,
@@ -606,13 +744,22 @@ async function verifyBattle(c, issuer, battleId) {
       derived: { winner: derivedWinner, scoreA: d.scoreA, scoreB: d.scoreB }, recorded: b.result,
       reason: ok ? 'ladder result re-derives from the pinned ledger hash + the published NPC stats + open rules' : 'recorded ladder result does not match a faithful replay' };
   }
-  if (!b.accept) return { ok: false, verdict: 'OPEN', reason: 'not accepted yet' };
-  if (!b.result) return { ok: false, verdict: 'UNRESOLVED', reason: 'not resolved yet' };
+  // Re-run the SAME accept selection resolveBattleTx used — first well-formed accept whose sender owns
+  // the pet. Verifying against whatever accept memo happened to be last would confirm the arithmetic of
+  // a re-rolled fight: the loser could send a second accept, move the seed ledger, and this endpoint
+  // would hand the new dice a PASS. A verifier that cannot fail on that is not a verifier.
+  const picked = await pickAccept(c, issuer, b);
+  b.accept = picked ? picked.accept : null;
+  const ignoredAccepts = b.accepts.length - (picked ? 1 : 0);
+  if (!b.accept && !b.result) return { ok: false, verdict: 'OPEN', reason: 'not accepted yet', ignoredAccepts };
+  if (!b.result) return { ok: false, verdict: 'UNRESOLVED', reason: 'not resolved yet', ignoredAccepts };
   if (b.result.winnerNid === 'VOID') {   // battle was voided for underpayment; refunds are on-ledger + checkable
-    const stake = Number(b.challenge.stakeDrops || 0), dA = Number(b.challenge.delivered || 0), dB = Number(b.accept.delivered || 0);
+    const stake = Number(b.challenge.stakeDrops || 0), dA = Number(b.challenge.delivered || 0), dB = b.accept ? Number(b.accept.delivered || 0) : 0;
     const legit = dA < stake || dB < stake;
-    return { ok: legit, verdict: legit ? 'VOID' : 'FAIL', battleId, reason: legit ? 'voided: a party delivered less than the agreed stake; refunded' : 'VOID recorded but both stakes were fully delivered' };
+    return { ok: legit, verdict: legit ? 'VOID' : 'FAIL', battleId, refunds: b.refunds, reason: legit ? 'voided: a party delivered less than the agreed stake; refunded' : 'VOID recorded but both stakes were fully delivered' };
   }
+  if (!b.accept) return { ok: false, verdict: 'FAIL', battleId, ignoredAccepts,
+    reason: 'a result was recorded but no accept on the ledger is a valid commitment to this challenge' };
   const { aNid } = b.challenge, { bNid } = b.accept;
   // SAME derivation as resolveBattleTx, for the same reason the ladder verifier uses it: verifying
   // against the memo's N would confirm the arithmetic while missing whether the seed was knowable
@@ -624,9 +771,11 @@ async function verifyBattle(c, issuer, battleId) {
   const lh = await ledgerHashOf(c, N);
   if (!lh) return { ok: false, verdict: 'ERROR', reason: 'pinned ledger not available' };
   const seed = seedFor(lh, battleId, aNid, bNid);
-  const hA = await loadHistory(c, issuer, aNid), hB = await loadHistory(c, issuer, bNid);
+  const hA = await loadHistory(c, issuer, aNid), hB = picked.history;   // pickAccept already read B's history
   const sA = stateAtLedger(hA.genesis, hA.interactions, N), sB = stateAtLedger(hB.genesis, hB.interactions, N);
-  const d = BR.resolveBattle(seed, sA, sB, aNid, bNid);
+  // As above: re-derive under the RECORDED ruleset version so a rules fix never invalidates a
+  // battle that was settled honestly under the older rules.
+  const d = BR.resolveBattle(seed, sA, sB, aNid, bNid, b.result.rv);
   const derivedWinner = d.winner === null ? 'DRAW' : d.winner;
   const winnerMatch = derivedWinner === b.result.winnerNid;
   const scoresMatch = d.scoreA === b.result.scoreA && d.scoreB === b.result.scoreB;
@@ -634,7 +783,7 @@ async function verifyBattle(c, issuer, battleId) {
   const paidRight = d.winner === null || b.result.dest === winnerOwner;
   const ok = winnerMatch && scoresMatch && paidRight;
   return { ok, verdict: ok ? 'PASS' : 'FAIL', battleId, N, seed,
-    seedLedger: N, acceptLedger: acceptLseq, claimedN,
+    seedLedger: N, acceptLedger: acceptLseq, claimedN, ignoredAccepts,
     ...(staleCommitment ? { warning: 'STALE_COMMITMENT', warningDetail:
       `the challenge memo pinned ledger ${claimedN}, which had already closed when the accept landed in ${acceptLseq}. `
       + 'That seed was public when the acceptor signed. Resolution used the derived ledger instead.' } : {}),
@@ -679,7 +828,12 @@ app.post('/battle/accept', async (req, res) => {
       const issuer = w.classicAddress;
       const b = await loadBattle(c, issuer, battleId);
       if (!b.challenge) return { error: 'unknown battleId' };
-      if (b.accept) return { error: 'already accepted' };
+      if (b.challenge.npc) return { error: 'that is a ladder battle, not a PvP challenge' };
+      if (b.result) return { error: 'that fight is already settled' };
+      // Only a VALID accept blocks this. Guarding on any accept memo let a griefer lock a challenge
+      // shut for one drop by sending a junk accept (nobody could then build a real one, and the
+      // challenger's stake sat at the issuer with no path out).
+      if (await pickAccept(c, issuer, b)) return { error: 'already accepted' };
       if (bNid === b.challenge.aNid) return { error: 'a pet cannot battle itself' };
       // must accept BEFORE the pinned ledger closes — otherwise ledgerHash(N) is known and the accepter
       // could join only when the seed already favors them. Closes the accepter-foreknowledge bias.
@@ -689,7 +843,11 @@ app.post('/battle/accept', async (req, res) => {
       if (!ps) return { error: 'pet not found' };
       if (ps.owner !== owner) return { error: 'you do not own this pet' };
       if (ps.alive === 0) return { error: 'a passed pet cannot battle' };
-      const drops = b.challenge.amount || '1';   // must match the challenger's stake
+      // Must MATCH the challenger's stake. loadBattle writes that to `stakeDrops`; this read was
+      // `b.challenge.amount`, a key no code path has set since 4a8438ab renamed it, so every accept
+      // built here was 1 drop and reported `matchStakeDrops: '1'`. Against a real staked challenge
+      // that is an automatic underpayment: deliveredB < stake, VOID, the fight never happens.
+      const drops = b.challenge.stakeDrops || '1';
       return { unsignedTx: tag({ TransactionType: 'Payment', Account: owner, Destination: issuer, Amount: String(drops),
           Memos: [{ Memo: { MemoType: hex(BATTLE_MEMO), MemoData: hex(['accept', battleId, bNid].join('|')) } }] }),
         signWith: 'owner (Xaman)', matchStakeDrops: String(drops) };
@@ -708,8 +866,17 @@ app.post('/battle/resolve', requireAdmin, async (req, res) => {
 });
 app.get('/battle/:battleId', async (req, res) => {
   try {
-    const b = await withClient((c, w) => loadBattle(c, w.classicAddress, req.params.battleId));
-    res.json({ status: !b.challenge ? 'NOT_FOUND' : b.result ? 'RESOLVED' : b.accept ? 'LIVE' : 'OPEN', ...b });
+    // Cached: the challenger's client polls this while it waits for a human to accept, and each
+    // uncached call is a full pass over the issuer's history. Settlement takes ~80s, so a few seconds
+    // of staleness costs the player nothing. Resolution and verification never read the cache.
+    const out = await cached('battle:' + req.params.battleId, 8000, () => withClient(async (c, w) => {
+      const issuer = w.classicAddress;
+      const b = await loadBattle(c, issuer, req.params.battleId);
+      const picked = await pickAccept(c, issuer, b);            // free when there are no accept memos
+      b.accept = picked ? picked.accept : null;
+      return { status: !b.challenge ? 'NOT_FOUND' : b.result ? 'RESOLVED' : b.accept ? 'LIVE' : 'OPEN', ...b };
+    }));
+    res.set('Cache-Control', 'public, max-age=8').json(out);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 app.get('/verify-battle/:battleId', async (req, res) => {
@@ -730,7 +897,7 @@ app.get('/verify-battle/:battleId', async (req, res) => {
 // payloads under this app's identity and show users transactions we did not author.
 app.post('/sign', async (req, res) => {
   if (!sdk) return res.status(503).json({ error: 'signing not configured (set XAMAN_API_KEY and XAMAN_API_SECRET)' });
-  const { kind, owner, nid, op, rung } = req.body || {};
+  const { kind, owner, nid, op, rung, battleId } = req.body || {};
   // signin is the one kind that cannot know the address yet — discovering it IS the point.
   // Every other kind still requires a valid owner up front.
   if (kind !== 'signin' && !xrpl.isValidClassicAddress(owner || '')) {
@@ -774,8 +941,69 @@ app.post('/sign', async (req, res) => {
       instruction = `Ledgerlings: challenge ${LADDER[rung].name}`;
       res.locals = { pinnedLedger: built.N };
 
+    } else if (kind === 'challenge') {
+      // Fight Club v1: PvP. FREE — the stake is hard-coded to 1 drop on BOTH sides, so the pot is 2 drops,
+      // the fee floors to 0, and the custody guard can never trip. No stakeXrp is accepted here; /sign is a
+      // fixed menu of intents and this build deliberately holds no real player XRP.
+      if (!nid) return res.status(400).json({ error: 'nid required' });
+      const built = await withClient(async (c, w) => {
+        const ps = await readState(c, w.classicAddress, nid);
+        if (!ps) return { error: 'pet not found' };
+        if (ps.owner !== owner) return { error: 'you do not own this pet' };
+        if (ps.alive === 0) return { error: 'a passed pet cannot battle' };
+        const cur = (await c.request({ command: 'ledger', ledger_index: 'validated' })).result.ledger_index;
+        // ABSOLUTE ledger index here, unlike the ladder branch above, and that asymmetry is required.
+        // Field 4 is inert for a ladder battle (no second party), but loadBattle reads it into
+        // challenge.N and the accept path rejects once curL >= N. Writing the margin (20) there would
+        // make every accept "expired" forever and the PvP path would be dead on arrival.
+        // Caller-supplied N is ignored outright: it buys nothing for fairness (the seed comes from the
+        // accept's landing ledger) and an unbounded one would defeat the deadline.
+        const N = cur + BATTLE_CHALLENGE_TTL;
+        return { N, tx: { TransactionType: 'Payment', Account: owner, Destination: w.classicAddress, Amount: '1',
+          Memos: [{ Memo: { MemoType: hex(BATTLE_MEMO), MemoData: hex(['challenge', nid, '1', String(N)].join('|')) } }] } };
+      });
+      if (built.error) return res.status(400).json(built);
+      txjson = built.tx;
+      instruction = `Ledgerlings: start a fight`;
+      // NOTE: for this kind pinnedLedger is the ACCEPT EXPIRY, not a seed ledger.
+      res.locals = { pinnedLedger: built.N };
+
+    } else if (kind === 'accept') {
+      if (!nid) return res.status(400).json({ error: 'nid required' });
+      const bid = String(battleId || '').toUpperCase();
+      if (!/^[0-9A-F]{64}$/.test(bid)) return res.status(400).json({ error: 'valid battleId required' });
+      const built = await withClient(async (c, w) => {
+        const issuer = w.classicAddress;
+        const b = await loadBattle(c, issuer, bid);
+        if (!b.challenge) return { error: 'unknown battleId' };
+        // MANDATORY: resolveBattleTx routes b.challenge.npc to resolveLadder BEFORE it ever reads
+        // b.accept, so drops sent as an accept against a ladder battleId are kept by the issuer with
+        // no refund path. Refuse to build that transaction at all.
+        if (b.challenge.npc) return { error: 'that is a ladder battle, not a PvP challenge' };
+        if (b.result) return { error: 'that fight is already settled' };
+        // Only a VALID accept closes the fight (see /battle/accept): a junk accept memo must not be
+        // able to lock an honest challenge shut for one drop.
+        if (await pickAccept(c, issuer, b)) return { error: 'already accepted' };
+        if (nid === b.challenge.aNid) return { error: 'a pet cannot battle itself' };
+        // Must accept BEFORE the challenge's expiry. Self-accept (both pets one owner) is deliberately
+        // ALLOWED: the seed is derived from the accept's landing ledger + margin, so it is unknowable to
+        // either side at signing regardless of who owns what.
+        const curL = (await c.request({ command: 'ledger', ledger_index: 'validated' })).result.ledger_index;
+        if (curL >= b.challenge.N) return { error: `challenge expired: pinned ledger ${b.challenge.N} already reached (current ${curL})` };
+        const ps = await readState(c, issuer, nid);
+        if (!ps) return { error: 'pet not found' };
+        if (ps.owner !== owner) return { error: 'you do not own this pet' };
+        if (ps.alive === 0) return { error: 'a passed pet cannot battle' };
+        return { tx: { TransactionType: 'Payment', Account: owner, Destination: issuer, Amount: '1',
+          Memos: [{ Memo: { MemoType: hex(BATTLE_MEMO), MemoData: hex(['accept', bid, nid].join('|')) } }] } };
+      });
+      if (built.error) return res.status(400).json(built);
+      txjson = built.tx;
+      instruction = `Ledgerlings: accept fight ${bid.slice(0, 8)}`;
+      // No res.locals: there is no pinnedLedger for an accept, and this tx's own hash is NOT the battleId.
+
     } else {
-      return res.status(400).json({ error: "kind must be 'interact' or 'ladder'" });
+      return res.status(400).json({ error: "kind must be 'interact', 'ladder', 'challenge' or 'accept'" });
     }
 
     // A SignIn payload proves control of an address and moves nothing, so it is not
@@ -848,12 +1076,16 @@ app.get('/ladder-rank/:nid', async (req, res) => {
         const r = await c.request(rq);
         for (const t of r.result.transactions) {
           const tx = t.tx || t.tx_json || {}; if (tx.TransactionType !== 'Payment') continue;
+          if (!t.meta || t.meta.TransactionResult !== 'tesSUCCESS') continue;
           const hash = tx.hash || t.hash, lseq = tx.ledger_index || t.ledger_index;
           for (const m of (tx.Memos || [])) {
             const md = m.Memo || {};
             try { if (unhex(md.MemoType || '') !== BATTLE_MEMO) continue; const f = unhex(md.MemoData || '').split('|');
-              if (f[0] === 'ladder' && f[1] === nid && hash) battles.push({ battleId: hash, rung: Number(f[2]), lseq, win: null });
-              else if (f[0] === 'result') { const bb = battles.find(x => x.battleId === f[1]); if (bb) bb.win = f[2] === nid; }
+              if (f[0] === 'ladder' && f[1] === nid && hash && tx.Destination === issuer) battles.push({ battleId: hash, rung: Number(f[2]), lseq, win: null });
+              // ISSUER-SIGNED results only — same rule as loadBattle. Anyone can send the issuer a
+              // Payment carrying a `result|…` memo, and counting one here would let a stranger write
+              // wins and losses onto any pet's public record for a drop.
+              else if (f[0] === 'result' && tx.Account === issuer) { const bb = battles.find(x => x.battleId === f[1]); if (bb && bb.win === null) bb.win = f[2] === nid; }
             } catch { /* skip */ }
           }
         }
@@ -872,6 +1104,120 @@ app.get('/ladder-rank/:nid', async (req, res) => {
         lastLedger: last ? last.lseq : null, lastWin: last ? last.win : null };
     });
     res.json(out);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── the fight board (public) ─────────────────────────────────────────────────────────────────────
+// Every resolved battle on the issuer, folded per pet, from ONE account_tx pass. Deliberately NOT
+// built from the battle-card NFTs: the card URI keeps w = winnerNid.slice(0,24), which is flags +
+// transfer fee + the first 8 bytes of the issuer AccountID — identical for every pet this issuer
+// mints, so a card cannot say WHICH pet won. The result memo carries the full 64-hex winner nid.
+// Also deliberately not a fan-out: /ladder-rank/:nid and loadBattle each do their own full scan.
+// Ranked by wins, tie-broken on best streak then highest rung. NEVER by stake volume — every battle
+// ever played staked 1 drop, so a stake column would rank battle count under a money label.
+const BOARD_MIN_BATTLES_FOR_WINRATE = 5;
+const BOARD_NOTE = 'Ladder battles are free and unlimited, so total wins is grindable. Win rate is shown only after '
+  + BOARD_MIN_BATTLES_FOR_WINRATE + ' resolved battles. Draws break a streak; voided battles are not counted at all.';
+app.get('/leaderboard', async (req, res) => {
+  try {
+    const q = Number(req.query.limit);
+    const limit = Number.isFinite(q) && q >= 1 ? Math.min(100, Math.floor(q)) : 25;
+    // Cached server-side, not just in a response header: this endpoint does its own full pass over the
+    // issuer's account_tx PLUS an account_nfts pass, on a fresh connection, and it is fired on every
+    // page load by every visitor whether or not they own a pet. The max-age header alone does nothing
+    // without a CDN in front, which there is not.
+    const out = await cached('leaderboard:' + limit, 30000, () => withClient(async (c, w) => {
+      const issuer = w.classicAddress;
+      const generatedLedger = (await c.request({ command: 'ledger', ledger_index: 'validated' })).result.ledger_index;
+      // battleId -> the whole battle, assembled from the four memo kinds. challenge/ladder are keyed by
+      // the TX HASH (the challenge hash IS the battleId); accept/result carry the battleId in field 1.
+      const B = new Map();
+      const bat = id => { let b = B.get(id); if (!b) { b = { aNid: null, bNid: null, rung: null, ladder: false, winnerNid: null, resultLseq: null }; B.set(id, b); } return b; };
+      let scannedTx = 0, marker;
+      do {
+        const r = await c.request({ command: 'account_tx', account: issuer, limit: 200, forward: true, marker });
+        for (const t of r.result.transactions) {
+          scannedTx++;
+          const tx = t.tx || t.tx_json || {}; if (tx.TransactionType !== 'Payment') continue;
+          if (!t.meta || t.meta.TransactionResult !== 'tesSUCCESS') continue;
+          const hash = tx.hash || t.hash || ''; const lseq = tx.ledger_index || t.ledger_index;
+          const toIssuer = tx.Destination === issuer, byIssuer = tx.Account === issuer;
+          for (const m of (tx.Memos || [])) {
+            const md = m.Memo || {};
+            try {
+              if (unhex(md.MemoType || '') !== BATTLE_MEMO) continue;
+              const f = unhex(md.MemoData || '').split('|'), kind = f[0];
+              // Same authority rules as loadBattle, because this board is a public scoreboard and every
+              // memo it reads is attacker-writable: commitments must be delivered TO the issuer, the
+              // FIRST accept is the one that counts, and only the ISSUER can declare a result. Without
+              // the last one the #1 slot was purchasable — forge a result memo naming your own pet.
+              if (kind === 'challenge' && hash && toIssuer) { const b = bat(hash); if (b.aNid == null) b.aNid = f[1]; }
+              else if (kind === 'ladder' && hash && toIssuer) { const b = bat(hash); if (b.aNid == null) { b.aNid = f[1]; b.rung = Number(f[2]); b.ladder = true; } }
+              else if (kind === 'accept' && f[1] && toIssuer) { const b = bat(f[1]); if (b.bNid == null) b.bNid = f[2]; }
+              else if (kind === 'result' && f[1] && byIssuer) { const b = bat(f[1]); if (b.winnerNid == null) { b.winnerNid = f[2]; b.resultLseq = lseq; } }
+            } catch { /* skip malformed memo */ }
+          }
+        }
+        marker = r.result.marker;
+      } while (marker);
+      // a battle counts only with BOTH a challenge/ladder and a result; folded oldest result first so
+      // the streak and the "last battle" fields come out in ledger order.
+      const settled = [...B.entries()]
+        .filter(([, b]) => b.aNid && b.winnerNid)
+        .map(([battleId, b]) => ({ battleId, ...b }))
+        .sort((x, y) => (x.resultLseq || 0) - (y.resultLseq || 0));
+
+      const P = new Map();
+      const row = nid => { let p = P.get(nid); if (!p) { p = { nid, played: 0, ladderPlayed: 0, pvpPlayed: 0, wins: 0, losses: 0,
+        draws: 0, voids: 0, currentStreak: 0, bestStreak: 0, highestRungBeaten: -1, lastLedger: null, lastWin: null }; P.set(nid, p); } return p; };
+      for (const b of settled) {
+        const pvp = !b.ladder && b.bNid;
+        // If the recorded winner is neither side, the accept this scan picked is not the accept the
+        // settlement used (anyone can send an accept memo, and a griefer's can land first). Credit
+        // nobody rather than credit the wrong pet.
+        if (pvp && !['DRAW', 'VOID', b.aNid, b.bNid].includes(b.winnerNid)) continue;
+        // Deduped: an accept naming the CHALLENGER's own pet made parts [X, X], so one crafted
+        // self-battle folded onto the same row twice — +2 wins and +2 streak, deterministically,
+        // for two transaction fees. Resolution now refuses to settle a self-battle at all; this is
+        // the second lock on the same door, because the board is what the ranking is read from.
+        const parts = [...new Set(pvp ? [b.aNid, b.bNid] : [b.aNid])];
+        for (const nid of parts) {
+          const p = row(nid);
+          if (b.winnerNid === 'VOID') { p.voids++; continue; }        // refunded, never happened — no played, no streak break
+          p.played++;
+          if (b.ladder) p.ladderPlayed++; else p.pvpPlayed++;
+          let win = false;
+          if (b.winnerNid === 'DRAW') { p.draws++; p.currentStreak = 0; }   // same as /ladder-rank, disclosed in `note`
+          else if (b.winnerNid === nid) {
+            p.wins++; p.currentStreak++; win = true;
+            if (b.ladder && Number.isInteger(b.rung)) p.highestRungBeaten = Math.max(p.highestRungBeaten, b.rung);
+          } else { p.losses++; p.currentStreak = 0; }                       // includes every NPC:* winner
+          p.bestStreak = Math.max(p.bestStreak, p.currentStreak);
+          p.lastLedger = b.resultLseq == null ? null : b.resultLseq;
+          p.lastWin = win;
+        }
+      }
+      // stage/alive from ONE account_nfts pass, not one readState per pet.
+      const live = new Map();
+      for (const n of (await allIssuerNfts(c, issuer))) {
+        if (n.NFTokenTaxon !== TAXON || !n.URI) continue;
+        try { live.set(n.NFTokenID, dec(n.URI)); } catch { /* unreadable URI -> treated as absent */ }
+      }
+      const rows = [...P.values()].map(p => {
+        const s = live.get(p.nid);
+        return { nid: p.nid, stage: s ? s.stage : null, alive: s ? s.alive : null,
+          played: p.played, ladderPlayed: p.ladderPlayed, pvpPlayed: p.pvpPlayed,
+          wins: p.wins, losses: p.losses, draws: p.draws, voids: p.voids,
+          currentStreak: p.currentStreak, bestStreak: p.bestStreak, highestRungBeaten: p.highestRungBeaten,
+          winRate: p.played >= BOARD_MIN_BATTLES_FOR_WINRATE ? Math.round(p.wins * 100 / p.played) : null,
+          lastLedger: p.lastLedger, lastWin: p.lastWin };
+      });
+      rows.sort((a, b) => (b.wins - a.wins) || (b.bestStreak - a.bestStreak) || (b.highestRungBeaten - a.highestRungBeaten)
+        || (a.played - b.played) || (a.nid < b.nid ? -1 : a.nid > b.nid ? 1 : 0));
+      return { generatedLedger, scannedTx, battles: settled.length, rulesetVersion: RULESET_VERSION,
+        minBattlesForWinRate: BOARD_MIN_BATTLES_FOR_WINRATE, note: BOARD_NOTE, rows: rows.slice(0, limit) };
+    }));
+    res.set('Cache-Control', 'public, max-age=30').json(out);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -1065,17 +1411,34 @@ let pollerLastLedger = 0;
 // start a fight that no one could finish. resolveBattleTx is idempotent (it returns ALREADY_RESOLVED
 // when a result memo exists), so calling it from the poller cannot double-settle or double-pay.
 const pendingLadder = new Map();                       // battleId (tx hash) -> pinned ledger N
+// Fight Club (PvP) needs the same treatment or it never finishes: /battle/resolve is requireAdmin and
+// resolvePendingLadders only ever sees 'ladder' memos, so a PvP fight would sit LIVE forever. Registered
+// on the ACCEPT, not the challenge, because the seed ledger is acceptLseq + BATTLE_LEDGER_MARGIN.
+const pendingPvp = new Map();                          // battleId (from the accept memo) -> seed ledger N
 
-function noteLadderChallenge(tx, hash) {
-  if (!hash) return;
+function noteLadderChallenge(tx, hash, lseq) {
   for (const mm of (tx.Memos || [])) {
     const md = mm.Memo || {};
     try {
       if (unhex(md.MemoType || '') !== BATTLE_MEMO) continue;
       const f = unhex(md.MemoData || '').split('|');
-      if (f[0] !== 'ladder') continue;
-      const N = Number(f[3]);
-      if (Number.isInteger(N)) pendingLadder.set(hash, N);
+      if (f[0] === 'ladder') {
+        if (!hash) continue;
+        const N = Number(f[3]);
+        if (Number.isInteger(N)) pendingLadder.set(hash, N);
+      } else if (f[0] === 'accept') {
+        // separate map on purpose: a ladder battleId keys its own pinned N, a PvP one keys a seed
+        // ledger derived from where the ACCEPT landed.
+        const bid = String(f[1] || '');
+        if (!/^[0-9A-F]{64}$/.test(bid.toUpperCase()) || !Number.isInteger(Number(lseq))) continue;
+        // FIRST accept only. This was a plain .set on the same key, so every later accept memo pushed
+        // the poller's own resolution ledger 20 further into the future — a loser who did not like the
+        // outcome could postpone settlement indefinitely for a drop a time, and the map moved in step
+        // with the seed ledger it was meant to pin. The value is only a lower bound on when it is worth
+        // scanning: resolveBattleTx derives the real seed ledger itself and returns the transient
+        // 'pinned ledger not validated yet' until it has closed, so an early entry is harmless.
+        if (!pendingPvp.has(bid)) pendingPvp.set(bid, Number(lseq) + BATTLE_LEDGER_MARGIN);
+      }
     } catch { /* skip malformed memo */ }
   }
 }
@@ -1099,6 +1462,25 @@ async function resolvePendingLadders(c, w) {
   return done;
 }
 
+// Same machinery for PvP. resolveBattleTx is idempotent (ALREADY_RESOLVED when a result memo exists),
+// so this cannot double-settle or double-pay even if an accept is registered twice.
+async function resolvePendingPvp(c, w) {
+  if (!pendingPvp.size) return 0;
+  const cur = (await c.request({ command: 'ledger', ledger_index: 'validated' })).result.ledger_index;
+  let done = 0;
+  for (const [battleId, N] of [...pendingPvp]) {
+    if (cur < N) continue;                             // seed ledger not validated yet
+    try {
+      const r = await resolveBattleTx(c, w, battleId);
+      if (r && r.error === 'pinned ledger not validated yet') continue;   // the only transient case
+      pendingPvp.delete(battleId);
+      done++;
+      console.log(`[poller] pvp ${battleId.slice(0, 8)} -> ${r && (r.status || r.winnerNid || 'resolved')}`);
+    } catch (e) { console.warn('[poller] pvp', battleId.slice(0, 8), e.message); }
+  }
+  return done;
+}
+
 // Pick up challenges signed while this process was not running, so a restart does not strand a fight.
 async function scanOpenLadders(c, issuer, backLedgers = 8000) {
   const cur = (await c.request({ command: 'ledger', ledger_index: 'validated' })).result.ledger_index;
@@ -1109,7 +1491,8 @@ async function scanOpenLadders(c, issuer, backLedgers = 8000) {
     for (const t of r.result.transactions) {
       const tx = t.tx || t.tx_json || {};
       if (tx.TransactionType !== 'Payment' || tx.Destination !== issuer) continue;
-      noteLadderChallenge(tx, t.hash || tx.hash);
+      // registers ladder challenges AND PvP accepts, so a restart mid-fight does not strand either.
+      noteLadderChallenge(tx, t.hash || tx.hash, tx.ledger_index || t.ledger_index);
     }
     seen += r.result.transactions.length;
     marker = r.result.marker;
@@ -1125,7 +1508,7 @@ async function pollerTick(c, w) {
       const tx = t.tx || t.tx_json || {}; const lseq = tx.ledger_index || t.ledger_index;
       if (lseq && lseq > pollerLastLedger) pollerLastLedger = lseq;
       if (tx.TransactionType === 'Payment' && tx.Destination === issuer) {
-        noteLadderChallenge(tx, t.hash || tx.hash);
+        noteLadderChallenge(tx, t.hash || tx.hash, lseq);
         for (const mm of (tx.Memos || [])) { const md = mm.Memo || {}; try { if (unhex(md.MemoType || '') === 'ledgerlings/op') { const p = unhex(md.MemoData || '').split('|'); if (p[1]) affected.add(p[1]); } } catch { /* skip */ } }
       }
     }
@@ -1133,6 +1516,7 @@ async function pollerTick(c, w) {
   } while (marker);
   for (const nid of affected) { try { await reconcilePet(c, w, nid); } catch (e) { console.warn('[poller] reconcile', nid.slice(0, 8), e.message); } }
   try { await resolvePendingLadders(c, w); } catch (e) { console.warn('[poller] ladders', e.message); }
+  try { await resolvePendingPvp(c, w); } catch (e) { console.warn('[poller] pvp', e.message); }
   return affected.size;
 }
 async function startPoller() {
@@ -1145,8 +1529,9 @@ async function startPoller() {
   pollerLastLedger = (await c.request({ command: 'ledger', ledger_index: 'validated' })).result.ledger_index;
   let openLadders = 0;
   try { openLadders = await scanOpenLadders(c, w.classicAddress); } catch (e) { console.warn('[poller] ladder scan', e.message); }
-  console.log(`[poller] watching ${w.classicAddress}; caught up ${pets.length} pet(s); ${openLadders} open ladder challenge(s); tracking from ledger ${pollerLastLedger}`);
+  console.log(`[poller] watching ${w.classicAddress}; caught up ${pets.length} pet(s); ${openLadders} open ladder challenge(s); ${pendingPvp.size} open pvp accept(s); tracking from ledger ${pollerLastLedger}`);
   try { await resolvePendingLadders(c, w); } catch (e) { console.warn('[poller] ladders', e.message); }
+  try { await resolvePendingPvp(c, w); } catch (e) { console.warn('[poller] pvp', e.message); }
   const loop = async () => {
     try { if (!c.isConnected()) await c.connect(); await pollerTick(c, w); }
     catch (e) { console.warn('[poller] tick', e.message); }
@@ -1277,8 +1662,9 @@ try{const v=await(await fetch('/verify/${esc(nid)}')).json();o.innerHTML=v.verdi
 // export the issuer primitives so a harness can drive the logic without starting a server.
 module.exports = { app, withClient, readState, submit, verifyPet, replay, enc, dec, hex, unhex, R, TAXON, TF_MUTABLE_TRANSFERABLE, ROYALTY_BPS, ENDPOINT,
   A, loadHistory, encAch, decAch, listAchievements, claimAchievements, verifyAchievement, ACHIEVEMENT_TAXON, RULESET_VERSION,
-  BR, seedFor, stateAtLedger, loadBattle, resolveBattleTx, verifyBattle, ledgerHashOf, BATTLE_TAXON, BATTLE_FEE_BPS, BATTLE_LEDGER_MARGIN, BATTLE_MEMO,
-  reconcilePet, pollerTick, startPoller, allIssuerNfts, genCardSvg, careRatio, LADDER, resolveLadder };
+  BR, seedFor, stateAtLedger, loadBattle, acceptWellFormed, pickAccept, refundBoth, resolveBattleTx, verifyBattle, ledgerHashOf, BATTLE_TAXON, BATTLE_FEE_BPS, BATTLE_LEDGER_MARGIN, BATTLE_MEMO,
+  reconcilePet, pollerTick, startPoller, allIssuerNfts, genCardSvg, careRatio, LADDER, resolveLadder,
+  BATTLE_CHALLENGE_TTL, noteLadderChallenge, pendingLadder, pendingPvp, resolvePendingPvp, resolvePendingLadders };
 
 if (require.main === module) {
   const PORT = process.env.PORT || 8788;
