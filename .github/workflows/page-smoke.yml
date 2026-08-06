@@ -1,0 +1,77 @@
+name: page-smoke
+
+# Every other gate in this repo can be green while the site is a blank screen.
+#
+# On 2026-08-05 a `let` declared below the render loop threw a temporal-dead-zone ReferenceError on
+# the first frame. That killed the canvas AND, because tick() runs during script evaluation, aborted
+# the rest of page init, so the mode banner and the adopt box never appeared either. The site was
+# blank for about three hours, spanning the launch post, and it was found by a human sending a
+# screenshot. `node --check` passed (syntax is not TDZ), docs-sync passed (files matched), and the
+# rules-engine parity harness passed 123,000 states. None of them load the page.
+#
+# So this job loads the page. Two ways, because they catch different things:
+#
+#   pr-branch  serves docs/ inside the runner and tests the code as proposed. Catches a bad change
+#              BEFORE it is merged, which is the only cheap moment.
+#   live-site  after a push to main, waits for Pages to serve the new commit and tests the real URL.
+#              Catches deploy-shaped failures a local serve cannot see: docs/ not regenerated, a
+#              Pages build failure, a stale image.
+#
+# See build/page_smoke.cjs for what is asserted and why.
+
+on:
+  pull_request:
+    paths: ['build/**', 'docs/**', '.github/workflows/page-smoke.yml']
+  push:
+    branches: [main]
+    paths: ['build/**', 'docs/**', '.github/workflows/page-smoke.yml']
+  workflow_dispatch:
+
+jobs:
+  pr-branch:
+    name: load the proposed pages
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: install a browser
+        run: npm i --no-save playwright@1.49.0 && npx playwright install --with-deps chromium
+      # Serve docs/ exactly as Pages does. Python's http.server is already on the runner, so this
+      # adds no dependency and cannot fail for reasons unrelated to what is being tested.
+      - name: serve docs/ and smoke it
+        run: |
+          python3 -m http.server 8080 --directory docs &
+          for i in $(seq 1 30); do curl -sf -o /dev/null http://localhost:8080/index.html && break; sleep 1; done
+          node build/page_smoke.cjs http://localhost:8080
+
+  live-site:
+    name: load the deployed site
+    # Only after main moves. A PR has nothing deployed to look at.
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: install a browser
+        run: npm i --no-save playwright@1.49.0 && npx playwright install --with-deps chromium
+      # Pages has taken 20-50s to serve a new commit in practice. Poll for a marker from THIS commit
+      # rather than sleeping a fixed time, so the job tests the new build and not the old one.
+      - name: wait for Pages to serve this commit
+        run: |
+          MARK=$(grep -o 'SIGN_CLOSE_MS' docs/index.html | head -1 || true)
+          for i in $(seq 1 40); do
+            BODY=$(curl -s -H 'Cache-Control: no-cache' "https://hugegreencandle.github.io/ledgerlings/index.html?cb=$RANDOM" || true)
+            LOCAL_LEN=$(wc -c < docs/index.html)
+            LIVE_LEN=$(printf '%s' "$BODY" | wc -c)
+            if [ "$LIVE_LEN" -gt 0 ] && [ "$((LOCAL_LEN - LIVE_LEN))" -le 200 ] && [ "$((LIVE_LEN - LOCAL_LEN))" -le 200 ]; then
+              echo "live size $LIVE_LEN ~= local $LOCAL_LEN after $((i*10))s"; exit 0
+            fi
+            sleep 10
+          done
+          echo "::warning::Pages did not appear to serve this commit within 400s; testing whatever is live"
+      - name: smoke the live site
+        run: node build/page_smoke.cjs https://hugegreencandle.github.io/ledgerlings
