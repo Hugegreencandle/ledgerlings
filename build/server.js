@@ -229,7 +229,7 @@ app.get('/config', (req, res) => {
   // the image is empty. There was also no way to tell a stale deploy from a live-but-broken one,
   // since the fix changed no HTTP surface. Now one request answers both questions.
   res.json({ sourceTag: SOURCE_TAG !== undefined ? SOURCE_TAG : null, taxon: TAXON, rulesetVersion: RULESET_VERSION,
-    pngCards: pngStatus(), fontFile: FONT_FILE });
+    pngCards: pngStatus(), fontFile: FONT_FILE, fontMode: FONT_MODE });
 });
 
 // current validated ledger — the frontend uses this as `now` for LIVE pets (real ledger indices) so it can
@@ -1605,48 +1605,88 @@ function genCardSvg(s, nid) {
 //  2. ONE UNSUPPORTED GLYPH TOFUS THE ENTIRE <text> ELEMENT, not just that character. Measured:
 //     "with emoji ✅ here" rendered as 17 empty boxes. So anything going into a PNG is passed
 //     through pngSafe() first. ✓ → · – are all present in DejaVu; emoji are not.
-// TTF, NOT woff2. The first version of this shipped a .woff2 and it rendered perfectly on macOS
-// and produced completely blank text on Railway — panels and background drew, every <text> was
-// empty. woff2 needs brotli support compiled into the resvg binary and the linux-x64 build does not
-// have it, while the darwin-arm64 one does. TTF is fontdb's native format and is always supported.
-// The route still returned HTTP 200 with a valid PNG, so nothing failed loudly; it was only caught
-// by downloading the production image and LOOKING at it.
-let FONT_BUF = null, FONT_FILE = null, PNG_STATUS = 'unprobed';
-function fontBuf() {
-  if (FONT_BUF === null) {
-    try {
-      const p = require.resolve('dejavu-fonts-ttf/ttf/DejaVuSans.ttf');
-      FONT_BUF = require('fs').readFileSync(p);
-      FONT_FILE = p.split('/').slice(-1)[0];
-      probeFont();
-    } catch (e) {
-      FONT_BUF = false; PNG_STATUS = 'font-missing';
-      console.error('[png] font unavailable, PNG cards disabled:', e.message);
-    }
-  }
-  return FONT_BUF;
+// FONT LOADING IS RESOLVED AT RUNTIME BY MEASUREMENT, NOT BY ASSUMPTION.
+//
+// This has now failed in production twice, both times rendering cards with a background, panels,
+// and ZERO text while returning a perfectly valid HTTP 200 PNG of the right dimensions. First guess
+// was the format (woff2 needing brotli); switching to TTF did not fix it, so that diagnosis was
+// wrong. The honest position is that the linux-x64 resvg build and the darwin-arm64 one do not
+// accept fonts by the same route, and this environment cannot be reproduced locally.
+//
+// So instead of a third guess: try each way of supplying the font, RENDER A TEST STRING with each,
+// and keep the first one that actually puts ink on the canvas. Whatever the cause, the server finds
+// the working configuration by itself on any host.
+//
+// The probe checks ALL THREE font families the cards actually use, not just one. genCardSvg asks
+// for "system-ui,sans-serif" and "monospace" while the fight card asks for "DejaVu Sans" — a config
+// that resolves the explicit name but not the generic ones would render the fight card and blank
+// half the pet card, which is exactly the sort of partial failure that reads as success.
+const FONT_FAMILY = 'DejaVu Sans';
+let FONT_FILE = null, FONT_MODE = null, FONT_OPTS = null, PNG_STATUS = 'unprobed', FONT_RESOLVED = false;
+
+function fontFamilyMap() {
+  // Map every generic the SVGs use onto the one font we ship, so "system-ui,sans-serif" and
+  // "monospace" resolve instead of silently falling through to nothing.
+  return { defaultFontFamily: FONT_FAMILY, sansSerifFamily: FONT_FAMILY, serifFamily: FONT_FAMILY,
+           monospaceFamily: FONT_FAMILY, cursiveFamily: FONT_FAMILY, fantasyFamily: FONT_FAMILY };
 }
-function pngStatus() { fontBuf(); return PNG_STATUS; }
-// Render a known string once and count the colours. A font the rasteriser accepts but cannot use
-// yields a picture with a background and nothing else, which is indistinguishable from success at
-// the HTTP layer. This turns that into a loud line in the deploy log.
-let FONT_PROBED = false;
-function probeFont() {
-  if (FONT_PROBED) return; FONT_PROBED = true;
-  try {
-    const { Resvg } = require('@resvg/resvg-js');
-    const svg = '<svg xmlns="http://www.w3.org/2000/svg" width="120" height="40">'
-      + '<rect width="120" height="40" fill="#000"/>'
-      + '<text x="4" y="28" font-family="DejaVu Sans" font-size="20" fill="#fff">Ag1</text></svg>';
-    const px = new Resvg(svg, { font: { fontBuffers: [FONT_BUF], loadSystemFonts: false, defaultFontFamily: 'DejaVu Sans' } }).render().pixels;
+
+// Does this option set put ink on the canvas for every family the cards use?
+function inksFor(opts) {
+  const { Resvg } = require('@resvg/resvg-js');
+  for (const fam of ['DejaVu Sans', 'system-ui,sans-serif', 'monospace']) {
+    const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="140" height="40">`
+      + `<rect width="140" height="40" fill="#000"/>`
+      + `<text x="4" y="28" font-family="${fam}" font-size="20" fill="#fff">Ag1</text></svg>`;
+    let px;
+    try { px = new Resvg(svg, { font: opts }).render().pixels; } catch { return false; }
     const seen = new Set();
     for (let i = 0; i < px.length; i += 4) seen.add((px[i] << 16) | (px[i + 1] << 8) | px[i + 2]);
-    if (seen.size > 2) { PNG_STATUS = 'ok'; console.log(`[png] font ok (${FONT_FILE}) — probe rasterised ${seen.size} distinct colours`); }
-    else { PNG_STATUS = 'blank-text';
-      console.error('[png] FONT LOADED BUT TEXT DOES NOT RASTERISE — every card will render blank. '
-        + 'This is the woff2-on-linux failure; the font must be a TTF.'); }
-  } catch (e) { PNG_STATUS = 'probe-failed'; console.error('[png] font probe failed:', e.message); }
+    if (seen.size <= 2) return false;      // background only: this family drew nothing
+  }
+  return true;
 }
+
+function resolveFont() {
+  if (FONT_RESOLVED) return FONT_OPTS;
+  FONT_RESOLVED = true;
+  const fam = fontFamilyMap();
+  let p = null, buf = null;
+  try {
+    p = require.resolve('dejavu-fonts-ttf/ttf/DejaVuSans.ttf');
+    FONT_FILE = p.split('/').slice(-1)[0];
+    buf = require('fs').readFileSync(p);
+  } catch (e) {
+    console.error('[png] bundled font not found:', e.message);
+  }
+  const dir = p ? p.split('/').slice(0, -1).join('/') : null;
+  // Ordered by how explicit they are. fontFiles first: it is the plainest instruction, and
+  // fontBuffers is the one that demonstrably works on darwin and produced blank text on linux.
+  const candidates = [
+    p && { mode: 'fontFiles', opts: { ...fam, loadSystemFonts: false, fontFiles: [p] } },
+    dir && { mode: 'fontDirs', opts: { ...fam, loadSystemFonts: false, fontDirs: [dir] } },
+    buf && { mode: 'fontBuffers', opts: { ...fam, loadSystemFonts: false, fontBuffers: [buf] } },
+    p && { mode: 'fontFiles+system', opts: { ...fam, loadSystemFonts: true, fontFiles: [p] } },
+    { mode: 'systemFonts', opts: { ...fam, loadSystemFonts: true } },
+  ].filter(Boolean);
+
+  const tried = [];
+  for (const c of candidates) {
+    let ok = false;
+    try { ok = inksFor(c.opts); } catch { ok = false; }
+    tried.push(`${c.mode}:${ok ? 'ok' : 'blank'}`);
+    if (ok) {
+      FONT_MODE = c.mode; FONT_OPTS = c.opts; PNG_STATUS = 'ok';
+      console.log(`[png] font ok via ${c.mode} (${FONT_FILE || 'system'}) — tried ${tried.join(' ')}`);
+      return FONT_OPTS;
+    }
+  }
+  PNG_STATUS = p ? 'blank-text' : 'font-missing';
+  FONT_MODE = 'none';
+  console.error(`[png] NO FONT CONFIGURATION RENDERS TEXT — every card will be blank. tried ${tried.join(' ')}`);
+  return null;
+}
+function pngStatus() { resolveFont(); return PNG_STATUS; }
 // Map the emoji this codebase actually uses onto glyphs DejaVu HAS. Verified by rendering and
 // looking at the output: ✓ (2713), ✕ (2715), → (2192) and · (00B7) all rasterise correctly, so the
 // substitution keeps meaning rather than deleting it. Do NOT widen this into a blanket strip of
@@ -1674,12 +1714,12 @@ function scaleSvg(svg, toWidth) {
   return svg.replace(/(<svg[^>]*\s)width="\d+"([^>]*\s)height="\d+"/, `$1width="${toWidth}"$2height="${nh}"`);
 }
 function svgToPng(svg, width) {
-  const f = fontBuf();
-  if (!f) return null;
+  // Whichever supply route was measured to actually draw glyphs on THIS host. Null means none of
+  // them did, and the routes return 503 rather than serving a picture with no text in it.
+  const font = resolveFont();
+  if (!font) return null;
   const { Resvg } = require('@resvg/resvg-js');
-  return new Resvg(pngSafe(scaleSvg(svg, width)), {
-    font: { fontBuffers: [f], loadSystemFonts: false, defaultFontFamily: 'DejaVu Sans' },
-  }).render().asPng();
+  return new Resvg(pngSafe(scaleSvg(svg, width)), { font }).render().asPng();
 }
 
 app.get('/card/:nid.png', async (req, res) => {

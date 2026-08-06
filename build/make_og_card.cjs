@@ -40,9 +40,14 @@ const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" 
 // TTF, not woff2 — a woff2 rendered fine locally and produced entirely blank text on Railway,
 // because woff2 needs brotli compiled into the resvg binary and the linux build lacks it.
 const fontPath = require.resolve('dejavu-fonts-ttf/ttf/DejaVuSans.ttf');
+// fontFiles by path, and every generic family mapped onto the one font we ship. fontBuffers is
+// what the server used when it rendered entirely blank text in production, so it is not trusted
+// here either. The size assertion at the bottom is the real guard.
 const { Resvg } = require('@resvg/resvg-js');
+const FAM = 'DejaVu Sans';
 const png = new Resvg(svg, {
-  font: { fontBuffers: [fs.readFileSync(fontPath)], loadSystemFonts: false, defaultFontFamily: 'DejaVu Sans' },
+  font: { fontFiles: [fontPath], loadSystemFonts: false,
+          defaultFontFamily: FAM, sansSerifFamily: FAM, serifFamily: FAM, monospaceFamily: FAM },
 }).render().asPng();
 
 const targets = [path.join(__dirname, 'og.png'), path.join(__dirname, '..', 'docs', 'og.png')];
