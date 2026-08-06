@@ -37,7 +37,9 @@ const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" 
   <text x="560" y="524" font-family="DejaVu Sans" font-size="22" fill="#8fb3bd">Free to adopt · no wallet needed · it dies if you ignore it</text>
 </svg>`;
 
-const fontPath = require.resolve('@fontsource/dejavu-sans/files/dejavu-sans-latin-400-normal.woff2');
+// TTF, not woff2 — a woff2 rendered fine locally and produced entirely blank text on Railway,
+// because woff2 needs brotli compiled into the resvg binary and the linux build lacks it.
+const fontPath = require.resolve('dejavu-fonts-ttf/ttf/DejaVuSans.ttf');
 const { Resvg } = require('@resvg/resvg-js');
 const png = new Resvg(svg, {
   font: { fontBuffers: [fs.readFileSync(fontPath)], loadSystemFonts: false, defaultFontFamily: 'DejaVu Sans' },

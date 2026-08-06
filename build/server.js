@@ -1599,15 +1599,40 @@ function genCardSvg(s, nid) {
 //  2. ONE UNSUPPORTED GLYPH TOFUS THE ENTIRE <text> ELEMENT, not just that character. Measured:
 //     "with emoji ✅ here" rendered as 17 empty boxes. So anything going into a PNG is passed
 //     through pngSafe() first. ✓ → · – are all present in DejaVu; emoji are not.
+// TTF, NOT woff2. The first version of this shipped a .woff2 and it rendered perfectly on macOS
+// and produced completely blank text on Railway — panels and background drew, every <text> was
+// empty. woff2 needs brotli support compiled into the resvg binary and the linux-x64 build does not
+// have it, while the darwin-arm64 one does. TTF is fontdb's native format and is always supported.
+// The route still returned HTTP 200 with a valid PNG, so nothing failed loudly; it was only caught
+// by downloading the production image and LOOKING at it.
 let FONT_BUF = null;
 function fontBuf() {
   if (FONT_BUF === null) {
     try {
-      FONT_BUF = require('fs').readFileSync(
-        require.resolve('@fontsource/dejavu-sans/files/dejavu-sans-latin-400-normal.woff2'));
+      FONT_BUF = require('fs').readFileSync(require.resolve('dejavu-fonts-ttf/ttf/DejaVuSans.ttf'));
+      probeFont();
     } catch (e) { FONT_BUF = false; console.error('[png] font unavailable, PNG cards disabled:', e.message); }
   }
   return FONT_BUF;
+}
+// Render a known string once and count the colours. A font the rasteriser accepts but cannot use
+// yields a picture with a background and nothing else, which is indistinguishable from success at
+// the HTTP layer. This turns that into a loud line in the deploy log.
+let FONT_PROBED = false;
+function probeFont() {
+  if (FONT_PROBED) return; FONT_PROBED = true;
+  try {
+    const { Resvg } = require('@resvg/resvg-js');
+    const svg = '<svg xmlns="http://www.w3.org/2000/svg" width="120" height="40">'
+      + '<rect width="120" height="40" fill="#000"/>'
+      + '<text x="4" y="28" font-family="DejaVu Sans" font-size="20" fill="#fff">Ag1</text></svg>';
+    const px = new Resvg(svg, { font: { fontBuffers: [FONT_BUF], loadSystemFonts: false, defaultFontFamily: 'DejaVu Sans' } }).render().pixels;
+    const seen = new Set();
+    for (let i = 0; i < px.length; i += 4) seen.add((px[i] << 16) | (px[i + 1] << 8) | px[i + 2]);
+    if (seen.size > 2) console.log(`[png] font ok — probe rasterised ${seen.size} distinct colours`);
+    else console.error('[png] FONT LOADED BUT TEXT DOES NOT RASTERISE — every card will render blank. '
+      + 'This is the woff2-on-linux failure; the font must be a TTF.');
+  } catch (e) { console.error('[png] font probe failed:', e.message); }
 }
 // Map the emoji this codebase actually uses onto glyphs DejaVu HAS. Verified by rendering and
 // looking at the output: ✓ (2713), ✕ (2715), → (2192) and · (00B7) all rasterise correctly, so the
