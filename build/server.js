@@ -239,7 +239,12 @@ app.get('/config', (req, res) => {
   // the image is empty. There was also no way to tell a stale deploy from a live-but-broken one,
   // since the fix changed no HTTP surface. Now one request answers both questions.
   res.json({ sourceTag: SOURCE_TAG !== undefined ? SOURCE_TAG : null, taxon: TAXON, rulesetVersion: RULESET_VERSION,
-    pngCards: pngStatus(), fontFile: FONT_FILE, fontMode: FONT_MODE });
+    pngCards: pngStatus(), fontFile: FONT_FILE, fontMode: FONT_MODE,
+    // Which care-award rule THIS build enforces. The fork changes no behaviour until its ledger
+    // arrives, so without this there is no way to tell a deployed fix from an undeployed one — and
+    // the gap is the whole risk: if the server is still writing awards under the old rule after the
+    // fork ledger passes, a verifier running the new rule will report DIVERGED on that history.
+    careFork: R.CARE_FORK });
 });
 
 // current validated ledger — the frontend uses this as `now` for LIVE pets (real ledger indices) so it can
