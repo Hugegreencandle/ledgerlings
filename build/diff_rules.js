@@ -20,7 +20,16 @@ const STRANGER = 'rStranger';
 const OPS = [R.FEED, R.PLAY, R.CLEAN, R.HEAL, 9 /* invalid op — must be a no-op action */];
 
 function makeScenario(rand, nSteps) {
-  const birth = Math.floor(rand() * 100); // small non-zero births too
+  // Births are drawn on BOTH sides of the care fork, and near enough to it that a single scenario's
+  // 40 steps can cross it mid-run. Without this the harness is worthless for the fork: it used to
+  // generate births in 0..100 and reach at most ~39M, while the fork sits at 106.14M, so 123,000
+  // states would all have exercised the pre-fork branch and the post-fork rule would have shipped
+  // with no parity coverage at all. A gate that cannot reach the new code is not a gate.
+  const F = R.CARE_FORK;
+  const r = rand();
+  const birth = r < 0.34 ? Math.floor(rand() * 100)                       // legacy, entirely pre-fork
+             : r < 0.67 ? F - Math.floor(rand() * 3 * R.DAY)              // starts before, crosses it
+             :            F + Math.floor(rand() * 3 * R.DAY);             // entirely post-fork
   const steps = [];
   let now = birth;
   for (let i = 0; i < nSteps; i++) {

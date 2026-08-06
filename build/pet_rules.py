@@ -18,6 +18,11 @@ HATCH = 60                        # ~4 min: hatch quickly so a new player sees a
 STAGE_AGE = [0, HATCH, 3 * DAY, 7 * DAY, 21 * DAY]   # EGG/BABY/TEEN/ADULT/ELDER thresholds
 LIFESPAN = 40 * DAY
 CARE_GOOD, CARE_CEIL = 10, 10
+# Mainnet ledger at which the care-award rule changes. MUST match CARE_FORK in pet_rules.js exactly
+# or the two engines diverge and the parity gate fails. See the long note at the award site in the
+# JS twin: interactions before this ledger keep the old scoring because the issuer already wrote
+# those awards into NFT URIs that the public verifier replays.
+CARE_FORK_LEDGER = 106140000
 
 EGG, BABY, TEEN, ADULT, ELDER, PASSED = range(6)
 RUNT, STANDARD, RARE, LEGENDARY = 1, 2, 3, 4
@@ -67,9 +72,15 @@ def genesis(birth_ledger, owner, name=None):
     return g
 
 
-def _award_care(s, was_low):
+def _award_care(s, was_low, now):
     s["care_max"] += CARE_CEIL                     # the cooldown-bounded ceiling
-    s["care"] += CARE_GOOD if was_low else CARE_GOOD // 2   # full credit only when the pet actually needed it
+    if now >= CARE_FORK_LEDGER:
+        # Full credit for acting while the pet is still WELL; half for a late rescue. The old rule
+        # did the opposite and so paid players to let the pet decay — COOLDOWN already prevents
+        # spam-feeding, so the "only when it needed it" test was rewarding neglect, not thrift.
+        s["care"] += CARE_GOOD // 2 if was_low else CARE_GOOD
+    else:
+        s["care"] += CARE_GOOD if was_low else CARE_GOOD // 2   # frozen: replays pre-fork history
 
 
 def step(state, op, now, sender):
@@ -105,9 +116,9 @@ def step(state, op, now, sender):
 
     # action (cooldown-gated; no infinite farming)
     if op == FEED and (s["last_feed"] == 0 or now - s["last_feed"] >= FEED_COOLDOWN):
-        _award_care(s, s["hunger"] < 50); s["hunger"] = _clamp(s["hunger"] + RESTORE); s["last_feed"] = now
+        _award_care(s, s["hunger"] < 50, now); s["hunger"] = _clamp(s["hunger"] + RESTORE); s["last_feed"] = now
     elif op == PLAY and (s["last_play"] == 0 or now - s["last_play"] >= PLAY_COOLDOWN):
-        _award_care(s, s["happiness"] < 50); s["happiness"] = _clamp(s["happiness"] + RESTORE); s["last_play"] = now
+        _award_care(s, s["happiness"] < 50, now); s["happiness"] = _clamp(s["happiness"] + RESTORE); s["last_play"] = now
     elif op == CLEAN:
         s["health"] = _clamp(s["health"] + 20)
     elif op == HEAL:
