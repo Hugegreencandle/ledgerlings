@@ -737,7 +737,15 @@ async function verifyBattle(c, issuer, battleId) {
     const d = BR.resolveBattle(seed, sA, npc.stats, aNid, npcId, b.result.rv), derivedWinner = d.winner === null ? 'DRAW' : d.winner;
     const ok = derivedWinner === b.result.winnerNid && d.scoreA === b.result.scoreA && d.scoreB === b.result.scoreB;
     return { ok, verdict: ok ? 'PASS' : 'FAIL', battleId, ladder: true, opponent: npc.name,
-      seedLedger: N, challengeLedger: lseq, claimedN,
+      seedLedger: N, challengeLedger: lseq, claimedN, seed,
+      // The arithmetic, not just the verdict. resolveBattle has always returned these; they were
+      // computed, checked and then dropped on the floor, so a player could see WHO won but never
+      // BY WHAT. A score with no roll and no power behind it is indistinguishable from a coin flip,
+      // which is exactly what this game is accused of being.
+      math: { rollA: d.rollA, powerA: d.powerA, scoreA: d.scoreA,
+              rollB: d.rollB, powerB: d.powerB, scoreB: d.scoreB, rulesetVersion: d.rulesetVersion },
+      names: { a: sA && sA.name ? sA.name : null, b: npc.name },
+      nids: { a: aNid, b: npcId },
       ...(staleCommitment ? { warning: 'STALE_COMMITMENT', warningDetail:
         `the challenge memo pinned ledger ${claimedN}, which had already closed when the challenge landed in ${lseq}. `
         + 'That seed was public at signing time. Resolution used the derived ledger instead.' } : {}),
@@ -784,6 +792,11 @@ async function verifyBattle(c, issuer, battleId) {
   const ok = winnerMatch && scoresMatch && paidRight;
   return { ok, verdict: ok ? 'PASS' : 'FAIL', battleId, N, seed,
     seedLedger: N, acceptLedger: acceptLseq, claimedN, ignoredAccepts,
+    // See the ladder branch: the arithmetic is the product, the verdict is only the receipt.
+    math: { rollA: d.rollA, powerA: d.powerA, scoreA: d.scoreA,
+            rollB: d.rollB, powerB: d.powerB, scoreB: d.scoreB, rulesetVersion: d.rulesetVersion },
+    names: { a: sA && sA.name ? sA.name : null, b: sB && sB.name ? sB.name : null },
+    nids: { a: aNid, b: bNid },
     ...(staleCommitment ? { warning: 'STALE_COMMITMENT', warningDetail:
       `the challenge memo pinned ledger ${claimedN}, which had already closed when the accept landed in ${acceptLseq}. `
       + 'That seed was public when the acceptor signed. Resolution used the derived ledger instead.' } : {}),
@@ -1655,6 +1668,116 @@ background:#0e3a4a;color:#6ff0ff;text-decoration:none;cursor:pointer;font-size:1
 <div style="color:#5f7d86;font-size:12px;margin-top:20px">Every feed, evolution and battle re-derives from XRPL ledger data under open rules. You don't trust the operator — you check.</div>
 <script>document.getElementById('v').onclick=async()=>{const o=document.getElementById('vout');o.textContent='re-deriving from ledger history…';
 try{const v=await(await fetch('/verify/${esc(nid)}')).json();o.innerHTML=v.verdict==='PASS'?'<span class=ok>✅ VERIFIED — '+v.interactions+' interactions reproduce from the open rules.</span>':v.verdict==='DIVERGED'?'<span class=bad>🚨 DIVERGED — does not match the open rules.</span>':'could not verify ('+(v.reason||'')+')';}catch(e){o.textContent='verify failed';}};</script>
+</div></body></html>`);
+  } catch (e) { res.status(500).type('text/html').send('error'); }
+});
+
+// Public shareable FIGHT page. The battle already computes roll + power + score for both sides,
+// writes them into an on-ledger memo and runs a public verifier against them — and until now none
+// of it reached a human. This route is the destination a shared battleId points at: the two pets by
+// name, the arithmetic spelled out, the seed ledger, and a re-check the reader runs themselves.
+//
+// It deliberately touches no transaction, no memo and no rule. A page cannot make a verifier
+// diverge, which is why it is the one combat-facing change that is not a ruleset migration.
+app.get('/b/:battleId', async (req, res) => {
+  try {
+    const battleId = String(req.params.battleId || '').toUpperCase();
+    if (!/^[0-9A-F]{64}$/.test(battleId)) return res.status(400).type('text/html').send('<h1>Not a battle id</h1>');
+    const v = await withClient((c, w) => verifyBattle(c, w.classicAddress, battleId));
+
+    const base = `${req.protocol}://${req.get('host')}`;
+    if (!v || v.verdict === 'NOT_FOUND')
+      return res.status(404).type('text/html').send('<h1>No such fight</h1>');
+
+    const m = v.math || {};
+    const ladder = !!v.ladder;
+    // A pet that was never named shows its short id rather than a blank, and the NPC keeps its name.
+    const nameA = (v.names && v.names.a) || (v.nids && v.nids.a ? shortNid(v.nids.a) : 'Challenger');
+    const nameB = (v.names && v.names.b) || (v.nids && v.nids.b ? shortNid(v.nids.b) : 'Opponent');
+    const unresolved = v.verdict === 'UNRESOLVED';
+    const aWon = !unresolved && m.scoreA > m.scoreB, drawn = !unresolved && m.scoreA === m.scoreB;
+    const winName = drawn ? null : aWon ? nameA : nameB;
+
+    const title = unresolved ? `A Ledgerlings fight is pending`
+      : drawn ? `${nameA} drew with ${nameB}`
+      : `${winName} won ${Math.max(m.scoreA, m.scoreB)}–${Math.min(m.scoreA, m.scoreB)}`;
+    const desc = unresolved
+      ? 'The dice come from a ledger that has not closed yet. Nobody can know this result — including the operator.'
+      : `Rolled on ledger ${v.seedLedger}, whose hash did not exist when the last player committed. Re-check it yourself.`;
+    // og:image points at the WINNER's card. It is an SVG, which X and Discord will not rasterise, so
+    // this preview is still a blank box on most platforms — a PNG renderer is the known next step and
+    // is deliberately not faked here.
+    // Only a real pet has a card. A ladder NPC's "nid" is the synthetic 'NPC:<id>', so fall back to
+    // the human's pet rather than emitting /card/NPC:runt.svg, which would 404 into a broken preview.
+    const rawWinNid = v.nids ? (aWon ? v.nids.a : v.nids.b) : null;
+    const cardNid = /^[0-9A-F]{64}$/i.test(String(rawWinNid || '')) ? rawWinNid
+      : (v.nids && /^[0-9A-F]{64}$/i.test(String(v.nids.a || '')) ? v.nids.a : null);
+    const card = cardNid ? `${base}/card/${esc(cardNid)}.svg` : '';
+
+    const row = (nm, roll, pow, score, won) => `<div class="side${won ? ' win' : ''}">
+      <div class="nm">${esc(nm)}${won ? ' <span class="crown">👑</span>' : ''}</div>
+      <div class="sum"><span class="roll">${roll}</span> <span class="op">+</span> <span class="pow">${pow}</span>
+        <span class="op">=</span> <b class="score">${score}</b></div>
+      <div class="lbl">dice + upbringing = score</div></div>`;
+
+    res.type('text/html').send(`<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${esc(title)} · Ledgerlings</title>
+<meta name="description" content="${esc(desc)}">
+<meta property="og:type" content="website"><meta property="og:title" content="${esc(title)}">
+<meta property="og:description" content="${esc(desc)}">${card ? `<meta property="og:image" content="${card}">` : ''}
+<meta name="twitter:card" content="summary_large_image"><meta name="twitter:title" content="${esc(title)}">
+<meta name="twitter:description" content="${esc(desc)}">${card ? `<meta name="twitter:image" content="${card}">` : ''}
+<style>body{margin:0;background:#05141a;color:#eaf6f9;font-family:system-ui,sans-serif}
+.wrap{max-width:640px;margin:0 auto;padding:24px;text-align:center}
+h1{color:#6ff0ff;font-size:22px;margin:0 0 2px}.sub{color:#5f7d86;font-size:13px;margin-bottom:18px}
+.bout{display:flex;gap:10px;align-items:stretch;justify-content:center;margin:18px 0}
+.side{flex:1;background:#0a2430;border:1px solid #14414f;border-radius:12px;padding:14px 8px}
+.side.win{border-color:#7CFFB2;background:#0c2e2a}
+.nm{font-weight:600;font-size:15px;margin-bottom:8px;word-break:break-word}
+.sum{font-family:ui-monospace,Menlo,monospace;font-size:15px}
+.roll{color:#6ff0ff}.pow{color:#ffd479}.op{color:#5f7d86}.score{color:#eaf6f9;font-size:19px}
+.lbl{color:#5f7d86;font-size:11px;margin-top:6px}
+.vs{align-self:center;color:#5f7d86;font-size:13px}
+.fair{background:#0a2430;border:1px solid #14414f;border-left:4px solid #6ff0ff;border-radius:8px;
+padding:12px 14px;margin:18px 0;text-align:left;font-size:13px;color:#8fb3bd;line-height:1.5}
+.fair b{color:#eaf6f9}.mono{font-family:ui-monospace,Menlo,monospace;color:#6ff0ff;word-break:break-all}
+a.cta,button{display:inline-block;margin:8px 6px;padding:11px 18px;border-radius:10px;border:1px solid #6ff0ff;
+background:#0e3a4a;color:#6ff0ff;text-decoration:none;cursor:pointer;font-size:15px}
+#vout{margin-top:12px;min-height:22px;font-size:14px}.ok{color:#7CFFB2}.bad{color:#ff6b6b}
+.warn{color:#ffd479;font-size:13px}</style></head><body><div class="wrap">
+<h1>${esc(title)}</h1>
+<div class="sub">${ladder ? 'ladder fight' : 'Fight Club'} · ${esc(shortNid(battleId))}</div>
+${unresolved ? `<div class="fair">This fight has not settled yet. The dice come from ledger
+  <b>${v.seedLedger || 'a future ledger'}</b>, which has not closed. Nobody can know the result yet —
+  not the players, not the operator.</div>`
+: `<div class="bout">${row(nameA, m.rollA, m.powerA, m.scoreA, aWon && !drawn)}
+   <div class="vs">vs</div>
+   ${row(nameB, m.rollB, m.powerB, m.scoreB, !aWon && !drawn)}</div>
+<div class="fair">
+  <b>Why this was not fixable.</b> The dice are the hash of ledger <b>${v.seedLedger}</b>.
+  That ledger had not closed when the last player committed, so nobody could know this result
+  in advance — including whoever runs the game.<br><br>
+  The <span class="roll">blue</span> number is the dice. The <span class="pow">amber</span> one is
+  how well the pet was raised. They add up, so care tilts a fight without deciding it.
+  ${v.warning ? `<br><br><span class="warn">⚠️ ${esc(v.warning)} — ${esc(v.warningDetail || '')}</span>` : ''}
+  <br><br>ruleset <span class="mono">${esc(m.rulesetVersion || '?')}</span> · seed
+  <span class="mono">${esc(String(v.seed || '').slice(0, 24))}…</span>
+</div>`}
+<button id="v">🔎 Re-check this fight</button>
+<a class="cta" href="${esc(APP_URL)}?b=${esc(battleId)}">⚔️ Rematch</a>
+<a class="cta" href="${esc(APP_URL)}">🐣 Adopt one</a>
+<a class="cta" href="/gallery.html">🏆 Gallery</a>
+<div id="vout"></div>
+<div style="color:#5f7d86;font-size:12px;margin-top:20px">You don't trust the operator — you check.
+The whole fight re-derives from XRPL ledger data under published rules.</div>
+<script>document.getElementById('v').onclick=async()=>{const o=document.getElementById('vout');
+o.textContent='re-deriving from ledger history…';
+try{const v=await(await fetch('/verify-battle/${esc(battleId)}')).json();
+o.innerHTML=v.verdict==='PASS'?'<span class=ok>✅ PASS — winner and scores re-derive from the pinned ledger hash and the open rules.</span>'
+:v.verdict==='UNRESOLVED'?'not settled yet — try again in a minute.'
+:'<span class=bad>🚨 '+v.verdict+' — '+(v.reason||'')+'</span>';}
+catch(e){o.textContent='could not reach the verifier';}};</script>
 </div></body></html>`);
   } catch (e) { res.status(500).type('text/html').send('error'); }
 });

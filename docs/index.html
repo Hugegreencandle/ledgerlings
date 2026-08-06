@@ -127,6 +127,11 @@
     <div style="opacity:.72;font-size:12px;margin-bottom:8px">Their stats are public before you fight. The dice are the hash of a ledger that has not closed yet, so nobody can know or rig the result. Free, and you can re-check it afterwards.</div>
     <div id="rungs" style="display:grid;gap:6px"></div>
     <div id="lMsg" style="margin-top:7px;font-size:12px;opacity:.85"></div>
+    <!-- The permalink to the full arithmetic, and the player's running record. The record used to be
+         written into #lMsg itself, which meant it landed one network round-trip after the result and
+         silently erased "you won that one" before most people had finished reading it. -->
+    <div id="fightLink" style="margin-top:5px;font-size:12px"></div>
+    <div id="rankMsg" style="margin-top:5px;font-size:12px;opacity:.7"></div>
   </div>
 
   <!-- Fight Club. Pet vs pet: a challenge is a 1-drop Payment whose tx hash IS the battle id, so
@@ -1195,7 +1200,7 @@ async function refreshRank(){
     // rendered "streak 0 · best rung -" for every pet no matter its record. highestRungBeaten is -1
     // for "never beaten a rung", hence the >=0 guard rather than a null check.
     if(j && (j.wins!=null))
-      document.getElementById('lMsg').textContent=`your record: ${j.wins} win(s) · streak ${j.currentStreak||0} · best rung ${(j.highestRungBeaten!=null&&j.highestRungBeaten>=0)?j.highestRungBeaten:'-'}`;
+      document.getElementById('rankMsg').textContent=`your record: ${j.wins} win(s) · streak ${j.currentStreak||0} · best rung ${(j.highestRungBeaten!=null&&j.highestRungBeaten>=0)?j.highestRungBeaten:'-'}`;
   }catch{ /* rank is cosmetic */ }
 }
 async function challengeRung(rung,name){
@@ -1253,9 +1258,18 @@ function watchBattle(battleId, msgEl, maxTries){
         } else {
           const won=wn===petNid;
           triggerActionAnim('battle', { win: won });
-          msg.textContent=won?'you won that one 🏆':'you lost that one';
+          // Show the SCORES, not just who won. b.result has carried scoreA/scoreB all along and this
+          // line used to throw them away, which is what made every fight feel like a coin flip: the
+          // player saw a coloured light for two seconds and never a number.
+          const mine=b.result.scoreA, theirs=b.result.scoreB;
+          const line=(Number.isFinite(mine)&&Number.isFinite(theirs))
+            ? (won?'you won ':'you lost ')+Math.max(mine,theirs)+'–'+Math.min(mine,theirs)
+            : (won?'you won that one 🏆':'you lost that one');
+          msg.textContent=line+(won?' 🏆':'');
           toast(won?'battle win 🏆':'battle result in');
         }
+        // A permalink to the full arithmetic. This is the thing worth sending to somebody.
+        showFightLink(battleId);
         noteFairness(battleId, msg);
         refreshRank(); pullLive(); loadBoard();
       }
@@ -1348,6 +1362,9 @@ function syncFightControls(){
     el.disabled=!on;
     el.style.opacity=on?'1':'.45';
     el.style.cursor=on?'pointer':'default';
+    // Say WHY it is greyed out. refreshOps() does this for the care buttons and this box was missed,
+    // so a player arriving on a challenge link met a dead form with no explanation at all.
+    el.title=on?'':'Adopt a pet first — it is free and needs no wallet.';
   });
 }
 
@@ -1423,11 +1440,19 @@ function copyFightId(){
   const el=document.getElementById('fightId');
   const id=fightBattleId||(el&&el.textContent)||'';
   if(!id) return;
+  // Copy a LINK, not a 64-character hash. A bare hash is not an invite: the recipient has no idea
+  // what it is, nowhere to paste it, and no way to see what they are being challenged to. The link
+  // opens the game with the code already filled in.
+  const share=APP_ORIGIN()+'?b='+id;
+  const done=()=>toast('challenge link copied — send it to someone');
   if(navigator.clipboard && navigator.clipboard.writeText){
-    try{ navigator.clipboard.writeText(id).then(()=>toast('battle id copied'), selectFightId); }
+    try{ navigator.clipboard.writeText(share).then(done, selectFightId); }
     catch{ selectFightId(); }
   } else selectFightId();
 }
+// Where this page lives, minus any query string, so a copied link never carries someone else's
+// ?b= code into a fresh invite.
+function APP_ORIGIN(){ return location.origin + location.pathname; }
 
 // A late-landing accept trips STALE_COMMITMENT on the verifier. It means "accepted after the
 // challenge expired", NOT "the seed was public" — the seed still came from a ledger that had not
@@ -1438,7 +1463,24 @@ async function noteFairness(battleId, msg){
     const v=await (await fetch(BK()+'/verify-battle/'+battleId)).json();
     if(v && v.warning==='STALE_COMMITMENT')
       msg.textContent += ' · accepted after the challenge expired — the result is still fair, the seed came from a ledger that had not closed at accept time';
+    // Say the PASS out loud. This used to stay silent unless something was wrong, so the one moment
+    // the player actually cares about the result was also the one moment the project's entire claim
+    // went unmentioned. A verifier nobody sees succeed is indistinguishable from no verifier.
+    else if(v && v.verdict==='PASS')
+      msg.textContent += ' · ✅ re-derived from ledger '+(v.seedLedger||'')+' just now — anyone can check it';
   }catch{ /* advisory only */ }
+}
+// The shareable object is the FIGHT, and it lives on the backend where it can be rendered for
+// someone with no wallet and no pet. Held in one place so the link is identical everywhere.
+function fightUrl(battleId){ return BK() ? BK()+'/b/'+battleId : ''; }
+function showFightLink(battleId){
+  const el=document.getElementById('fightLink'); if(!el||!BK()) return;
+  el.innerHTML='';
+  const a=document.createElement('a');
+  a.href=fightUrl(battleId); a.target='_blank'; a.rel='noopener';
+  a.textContent='🔗 see the numbers, and send this to someone';
+  a.style.cssText='color:#6ff0ff;font-size:12px;text-decoration:underline';
+  el.appendChild(a);
 }
 
 // The board is a projection of the issuer's battle memos. It is cosmetic: it must never block or
@@ -1484,6 +1526,22 @@ function initFightClub(){
   document.getElementById('fightCode').addEventListener('keydown',e=>{ if(e.key==='Enter') acceptFight(); });
   syncFightControls();
   if(BK()){ box.style.display='block'; loadBoard(); }   // the board is public: no pet required
+  acceptInviteFromUrl();
+}
+// Someone was sent a challenge link. Fill the code in, show them the fight they are being invited
+// to, and put the box in front of them. Without this a shared link opens a game that looks exactly
+// like the one a stranger would see, with the invite sitting unread in the address bar.
+function acceptInviteFromUrl(){
+  let id='';
+  try{ id=(new URLSearchParams(location.search).get('b')||'').trim().toUpperCase(); }catch{ return; }
+  if(!/^[0-9A-F]{64}$/.test(id)) return;
+  const code=document.getElementById('fightCode'); if(code) code.value=id;
+  const box=document.getElementById('fightBox');
+  if(box){ box.style.display='block'; try{ box.scrollIntoView({behavior:'smooth',block:'center'}); }catch{} }
+  const m=document.getElementById('fMsg');
+  if(m) m.innerHTML='you were challenged. <a href="'+fightUrl(id)+'" target="_blank" rel="noopener" '
+    +'style="color:#6ff0ff;text-decoration:underline">see the fight</a>'
+    + (petNid ? ' — then hit Accept.' : ' — adopt a pet above, then hit Accept.');
 }
 initFightClub();
 
