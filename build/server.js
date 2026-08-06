@@ -67,7 +67,17 @@ const BATTLE_LEDGER_MARGIN = Number(process.env.BATTLE_LEDGER_MARGIN || 20);
 // This is an EXPIRY written as an ABSOLUTE ledger index into memo field 4, not a seed commitment: the seed
 // ledger is always derived at resolution from the ACCEPT's landing ledger (+ BATTLE_LEDGER_MARGIN), so the
 // dice are unknowable at the moment of the last commitment no matter what this value is.
-const BATTLE_CHALLENGE_TTL = Number(process.env.BATTLE_CHALLENGE_TTL || 900);   // ledgers (~60 min)
+// 10800 ledgers at 4s each is 12 hours. It was 900, i.e. ONE HOUR, which is shorter than a
+// timezone gap: challenge a friend and unless they happen to have Xaman open, the challenge expires
+// before they ever see it. That made expiry the default outcome of challenging a human, which is
+// the exact action the feature exists for.
+//
+// NOT 24 HOURS, and the reason is measured rather than assumed. A never-touched pet is dead by
+// ledger 28802, which is 1.33 days. A passed pet forfeits, so an open challenge is also a window in
+// which an opponent can simply wait for the challenger's pet to weaken and then accept for a
+// near-free win. At 12h a challenge spans 37% of a neglected pet's whole lifespan; at 24h it spans
+// 75%, which makes waiting a strategy rather than an edge case.
+const BATTLE_CHALLENGE_TTL = Number(process.env.BATTLE_CHALLENGE_TTL || 10800);   // ledgers (12h at 4s)
 const BATTLE_MEMO = 'ledgerlings/battle';
 // House ladder: PUBLISHED NPC opponents (open stat blocks, versioned). Because the opponent's stats are public
 // + fixed, a ladder battle is as provably-fair as PvP — the seed is still the pinned ledger hash and

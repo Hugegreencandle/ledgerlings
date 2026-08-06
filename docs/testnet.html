@@ -852,7 +852,11 @@ let fightRole=null;                     // 'A' = challenger · 'B' = acceptor ·
 let fightExpiry=null;                   // absolute ledger this challenge stays acceptable until
 let BOARD=[];                           // last /leaderboard rows, for render only
 const FIGHT_POLL_MS=6000,               // one poll per ~1.5 ledgers
-      FIGHT_POLL_A_MAX=600,             // challenger: ~60 min, a human has to accept first
+      // Challenger watches for ~60 min. That is deliberately SHORTER than the 12-hour challenge
+      // window: polling for twelve hours would run a full issuer-history scan per tick for every
+      // open challenge. When the budget runs out the message says the challenge is still open
+      // rather than pretending it lapsed.
+      FIGHT_POLL_A_MAX=600,
       FIGHT_POLL_B_MAX=40,              // acceptor: ~4 min, settlement is already pinned
       // Every GET /battle/:id is a full pass over the issuer's transaction history, and that cost grows
       // with total game history because every interaction in this game is a Payment to the same issuer.
@@ -1251,9 +1255,17 @@ function watchBattle(battleId, msgEl, maxTries){
     if(++tries>cap){
       clearInterval(t);
       // Never fabricate a result. The fight settles on the ledger whether or not this tab is open.
-      msg.textContent = (lastStatus==='OPEN' && fightExpiry)
+      // And never claim the challenge LAPSED just because this tab stopped watching. The poll budget
+      // is ~60 minutes; a challenge now stays acceptable for 12 hours, so for most of its life the
+      // watcher gives up while the challenge is still perfectly open. Only say nobody accepted if
+      // the ledger has actually passed the deadline.
+      const nowLedger = (typeof nowL==='function') ? nowL() : null;
+      const reallyExpired = fightExpiry && nowLedger && nowLedger >= fightExpiry;
+      msg.textContent = reallyExpired
         ? 'nobody accepted before ledger '+fightExpiry+'. Start another.'
-        : 'still waiting — reopen this page later, the result is on the ledger either way';
+        : (lastStatus==='OPEN' && fightExpiry)
+          ? 'still open until ledger '+fightExpiry+'. This tab stopped watching, but the challenge stands and the result lands on the ledger either way.'
+          : 'still waiting — reopen this page later, the result is on the ledger either way';
       return;
     }
     // back off after the first two minutes (see FIGHT_POLL_FAST) — the timer keeps its 60-minute
@@ -1409,7 +1421,9 @@ async function startFight(){
     document.getElementById('fightIdRow').style.display='block';
     document.getElementById('fightId').textContent=txid;
     document.getElementById('fMsg').textContent=
-      'share this battle id.'+(fightExpiry?(' Open until ledger '+fightExpiry+'.'):'');
+      // A raw ledger index tells a human nothing about whether their friend has time to accept.
+      // Ledgers close every ~4s, so the remaining count converts to a plain duration.
+      'share this battle id.'+(fightExpiry?(' Open for about '+hoursUntil(fightExpiry)+'.'):'');
     watchBattle(txid, document.getElementById('fMsg'), FIGHT_POLL_A_MAX);
   }, {ws:j.ws});
 }
@@ -1494,6 +1508,15 @@ async function noteFairness(battleId, msg){
 // The shareable object is the FIGHT, and it lives on the backend where it can be rendered for
 // someone with no wallet and no pet. Held in one place so the link is identical everywhere.
 function fightUrl(battleId){ return BK() ? BK()+'/b/'+battleId : ''; }
+// Ledger indices are the honest unit but a useless one to read. XRPL closes one every ~4s, which is
+// the same 4s pet_rules assumes (DAY = 21600 ledgers), so the conversion is not a guess.
+function hoursUntil(targetLedger){
+  const n = (typeof nowL==='function') ? nowL() : null;
+  if(!n || !targetLedger || targetLedger<=n) return 'a short while';
+  const mins = Math.round((targetLedger-n)*4/60);
+  if(mins < 90) return mins+' minutes';
+  return Math.round(mins/60)+' hours';
+}
 function showFightLink(battleId){
   const el=document.getElementById('fightLink'); if(!el||!BK()) return;
   el.innerHTML='';
