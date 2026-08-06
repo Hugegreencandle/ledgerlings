@@ -4,6 +4,21 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
 <title>Ledgerlings</title>
+<!-- Link previews. This page had NO og: tags at all, so the launch post previewed as a bare URL,
+     and the pet/fight pages pointed og:image at an SVG, which no platform rasterises. og.png is a
+     committed 1200x630 raster (regenerate with node build/make_og_card.cjs) because GitHub Pages
+     runs no code and cannot render one per request. Absolute URL: relative og:image is ignored. -->
+<meta name="description" content="A pet that lives on the XRP Ledger. Feed it, fight it, and check the maths — every result re-derives from ledger history, so you can catch the operator cheating.">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Ledgerlings">
+<meta property="og:title" content="Ledgerlings — a pet you can audit">
+<meta property="og:description" content="Free to adopt, no wallet needed, and it dies if you ignore it. Every result re-derives from XRPL ledger history under open rules.">
+<meta property="og:image" content="https://hugegreencandle.github.io/ledgerlings/og.png">
+<meta property="og:image:width" content="1200"><meta property="og:image:height" content="630">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="Ledgerlings — a pet you can audit">
+<meta name="twitter:description" content="Free to adopt, no wallet needed, and it dies if you ignore it. Every result re-derives from XRPL ledger history under open rules.">
+<meta name="twitter:image" content="https://hugegreencandle.github.io/ledgerlings/og.png">
 <style>
   :root{--ink:#0B1B2B;--base:#1E8A9C;--glow:#19C3E6;--hot:#6FF0FF;--blush:#E86A8A;--grey:#9AA8B0}
   *{box-sizing:border-box;-webkit-tap-highlight-color:transparent;user-select:none;font-family:ui-monospace,Menlo,monospace}

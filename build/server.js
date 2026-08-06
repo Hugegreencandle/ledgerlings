@@ -1587,6 +1587,73 @@ function genCardSvg(s, nid) {
   <text x="315" y="286" font-family="system-ui,sans-serif" font-size="13" fill="#5f7d86">Ledgerlings · a pet you can audit</text>
 </svg>`;
 }
+// ---- PNG rendering -----------------------------------------------------------------------------
+// X, Discord, Slack, LinkedIn and Facebook all refuse to rasterise SVG, so every og:image this
+// project has ever emitted previewed as a blank box — including the launch post. These render the
+// same cards to PNG.
+//
+// TWO THINGS THAT WILL BREAK THIS IF CHANGED CARELESSLY:
+//  1. The font is BUNDLED and loadSystemFonts is false. Railway containers have essentially no
+//     fonts, so relying on the host would render every glyph blank there while looking perfect on
+//     a Mac. The font is an npm dependency (DejaVu, OFL licensed) rather than a committed binary.
+//  2. ONE UNSUPPORTED GLYPH TOFUS THE ENTIRE <text> ELEMENT, not just that character. Measured:
+//     "with emoji ✅ here" rendered as 17 empty boxes. So anything going into a PNG is passed
+//     through pngSafe() first. ✓ → · – are all present in DejaVu; emoji are not.
+let FONT_BUF = null;
+function fontBuf() {
+  if (FONT_BUF === null) {
+    try {
+      FONT_BUF = require('fs').readFileSync(
+        require.resolve('@fontsource/dejavu-sans/files/dejavu-sans-latin-400-normal.woff2'));
+    } catch (e) { FONT_BUF = false; console.error('[png] font unavailable, PNG cards disabled:', e.message); }
+  }
+  return FONT_BUF;
+}
+// Map the emoji this codebase actually uses onto glyphs DejaVu HAS. Verified by rendering and
+// looking at the output: ✓ (2713), ✕ (2715), → (2192) and · (00B7) all rasterise correctly, so the
+// substitution keeps meaning rather than deleting it. Do NOT widen this into a blanket strip of
+// U+2600-27BF — that block contains ✓ and ✕, and removing them silently blanked the dead pet's face.
+const EMOJI_SUBS = [
+  [/✅/g, '✓'], [/❌/g, '✕'], [/⚔️?/g, ''], [/🏆/g, ''], [/🥊/g, ''],
+  [/🐣/g, ''], [/🔎/g, ''], [/👑/g, ''], [/💥/g, ''], [/🥚/g, ''], [/⚠️?/g, '!'],
+];
+function pngSafe(str) {
+  let s = String(str);
+  for (const [re, to] of EMOJI_SUBS) s = s.replace(re, to);
+  // Whatever is left: drop astral-plane emoji and variation selectors only. One unsupported glyph
+  // tofus its entire <text> element, so this is a correctness measure, not a cosmetic one.
+  return s.replace(/[\u{1F000}-\u{1FAFF}\u{FE0F}\u{2B00}-\u{2BFF}]/gu, '');
+}
+// resvg-js ignores `fitTo` in this version — width, zoom and original all returned the native size
+// when measured. So scale by rewriting the root <svg> width/height instead; the viewBox is already
+// present on both cards, so the geometry scales cleanly.
+function scaleSvg(svg, toWidth) {
+  const m = svg.match(/<svg[^>]*\swidth="(\d+)"[^>]*\sheight="(\d+)"/);
+  if (!m || !toWidth) return svg;
+  const w = Number(m[1]), h = Number(m[2]);
+  if (!w || w >= toWidth) return svg;
+  const nh = Math.round(h * (toWidth / w));
+  return svg.replace(/(<svg[^>]*\s)width="\d+"([^>]*\s)height="\d+"/, `$1width="${toWidth}"$2height="${nh}"`);
+}
+function svgToPng(svg, width) {
+  const f = fontBuf();
+  if (!f) return null;
+  const { Resvg } = require('@resvg/resvg-js');
+  return new Resvg(pngSafe(scaleSvg(svg, width)), {
+    font: { fontBuffers: [f], loadSystemFonts: false, defaultFontFamily: 'DejaVu Sans' },
+  }).render().asPng();
+}
+
+app.get('/card/:nid.png', async (req, res) => {
+  try {
+    const s = await withClient((c, w) => readState(c, w.classicAddress, req.params.nid));
+    if (!s) return res.status(404).type('text/plain').send('pet not found');
+    const png = svgToPng(genCardSvg(s, req.params.nid), 1200);
+    if (!png) return res.status(503).type('text/plain').send('png rendering unavailable');
+    res.type('image/png').set('Cache-Control', 'public, max-age=300').send(png);
+  } catch (e) { res.status(500).type('text/plain').send('error'); }
+});
+
 app.get('/card/:nid.svg', async (req, res) => {
   try {
     const s = await withClient((c, w) => readState(c, w.classicAddress, req.params.nid));
@@ -1638,7 +1705,9 @@ app.get('/p/:nid', async (req, res) => {
     if (!s) return res.status(404).type('text/html').send('<h1>Ledgerling not found</h1>');
     const stage = R.STAGE[s.stage] || 'egg', form = R.FORM[s.form] || '-';
     const base = `${req.protocol}://${req.get('host')}`;
-    const card = `${base}/card/${esc(nid)}.svg`;
+    // PNG, not SVG: no social platform rasterises SVG, so the previous og:image previewed blank
+    // everywhere it was ever posted. The .svg route stays for the gallery's inline <img> tags.
+    const card = `${base}/card/${esc(nid)}.png`;
     const title = `Ledgerling ${shortNid(nid)} — ${esc(stage)}${s.form ? ' · ' + esc(form) : ''}`;
     const desc = `A provably-fair on-chain pet. care ${s.care} (${Math.round(careRatio(s) * 100)}%). Its whole life re-derives from the XRPL — verify it yourself.`;
     res.type('text/html').send(`<!doctype html><html lang="en"><head><meta charset="utf-8">
@@ -1670,6 +1739,63 @@ background:#0e3a4a;color:#6ff0ff;text-decoration:none;cursor:pointer;font-size:1
 try{const v=await(await fetch('/verify/${esc(nid)}')).json();o.innerHTML=v.verdict==='PASS'?'<span class=ok>✅ VERIFIED — '+v.interactions+' interactions reproduce from the open rules.</span>':v.verdict==='DIVERGED'?'<span class=bad>🚨 DIVERGED — does not match the open rules.</span>':'could not verify ('+(v.reason||'')+')';}catch(e){o.textContent='verify failed';}};</script>
 </div></body></html>`);
   } catch (e) { res.status(500).type('text/html').send('error'); }
+});
+
+// The share image for a fight: 1200x630, the ratio every platform crops to. Deliberately contains
+// no emoji (see pngSafe) and no glyph outside DejaVu's latin coverage. The point of the picture is
+// the arithmetic — a stranger scrolling past should be able to read WHY somebody won without
+// opening anything.
+function genFightSvg(v) {
+  const m = v.math || {};
+  const nm = (x, fb) => esc(pngSafe(String(x || fb)).slice(0, 18));
+  const aName = nm(v.names && v.names.a, v.nids && v.nids.a ? shortNid(v.nids.a) : 'Challenger');
+  const bName = nm(v.names && v.names.b, v.nids && v.nids.b ? shortNid(v.nids.b) : 'Opponent');
+  const aWon = m.scoreA > m.scoreB, drawn = m.scoreA === m.scoreB;
+  const side = (x, name, roll, pow, score, won) => `
+    <g transform="translate(${x},0)">
+      <rect x="0" y="150" width="440" height="300" rx="18" fill="${won ? '#0c2e2a' : '#0a2430'}"
+            stroke="${won ? '#7CFFB2' : '#14414f'}" stroke-width="${won ? 3 : 1}"/>
+      <text x="220" y="205" font-family="DejaVu Sans" font-size="30" font-weight="700"
+            text-anchor="middle" fill="${won ? '#7CFFB2' : '#eaf6f9'}">${name}</text>
+      <text x="220" y="300" font-family="DejaVu Sans" font-size="66" font-weight="700"
+            text-anchor="middle" fill="#eaf6f9">${score}</text>
+      <text x="220" y="360" font-family="DejaVu Sans" font-size="26" text-anchor="middle" fill="#8fb3bd">
+        <tspan fill="#6ff0ff">${roll}</tspan> + <tspan fill="#ffd479">${pow}</tspan></text>
+      <text x="220" y="398" font-family="DejaVu Sans" font-size="17" text-anchor="middle"
+            fill="#5f7d86">dice + upbringing</text>
+    </g>`;
+  const headline = drawn ? `${aName} drew with ${bName}`
+    : `${aWon ? aName : bName} won ${Math.max(m.scoreA, m.scoreB)} - ${Math.min(m.scoreA, m.scoreB)}`;
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630">
+  <defs><radialGradient id="bg" cx="50%" cy="30%" r="85%">
+    <stop offset="0%" stop-color="#0e3a4a"/><stop offset="100%" stop-color="#05141a"/></radialGradient></defs>
+  <rect width="1200" height="630" fill="url(#bg)"/>
+  <text x="600" y="88" font-family="DejaVu Sans" font-size="44" font-weight="700"
+        text-anchor="middle" fill="#6ff0ff">${esc(headline)}</text>
+  <text x="600" y="128" font-family="DejaVu Sans" font-size="21" text-anchor="middle" fill="#8fb3bd">
+    ${v.ladder ? 'Ledgerlings ladder' : 'Ledgerlings Fight Club'}</text>
+  ${side(90, aName, m.rollA, m.powerA, m.scoreA, aWon && !drawn)}
+  <text x="600" y="315" font-family="DejaVu Sans" font-size="30" text-anchor="middle" fill="#5f7d86">vs</text>
+  ${side(670, bName, m.rollB, m.powerB, m.scoreB, !aWon && !drawn)}
+  <text x="600" y="512" font-family="DejaVu Sans" font-size="23" text-anchor="middle" fill="#7CFFB2">
+    ✓ the dice were the hash of ledger ${esc(String(v.seedLedger || '?'))}</text>
+  <text x="600" y="548" font-family="DejaVu Sans" font-size="19" text-anchor="middle" fill="#8fb3bd">
+    which had not closed when the last player committed. Nobody could know this.</text>
+  <text x="600" y="596" font-family="DejaVu Sans" font-size="17" text-anchor="middle" fill="#5f7d86">
+    Ledgerlings · re-derive it yourself</text>
+</svg>`;
+}
+app.get('/bcard/:battleId.png', async (req, res) => {
+  try {
+    const battleId = String(req.params.battleId || '').toUpperCase();
+    if (!/^[0-9A-F]{64}$/.test(battleId)) return res.status(400).type('text/plain').send('bad id');
+    const v = await withClient((c, w) => verifyBattle(c, w.classicAddress, battleId));
+    if (!v || v.verdict === 'NOT_FOUND') return res.status(404).type('text/plain').send('no such fight');
+    if (!v.math) return res.status(409).type('text/plain').send('fight not settled yet');
+    const png = svgToPng(genFightSvg(v));
+    if (!png) return res.status(503).type('text/plain').send('png rendering unavailable');
+    res.type('image/png').set('Cache-Control', 'public, max-age=300').send(png);
+  } catch (e) { res.status(500).type('text/plain').send('error'); }
 });
 
 // Public shareable FIGHT page. The battle already computes roll + power + score for both sides,
@@ -1712,7 +1838,11 @@ app.get('/b/:battleId', async (req, res) => {
     const rawWinNid = v.nids ? (aWon ? v.nids.a : v.nids.b) : null;
     const cardNid = /^[0-9A-F]{64}$/i.test(String(rawWinNid || '')) ? rawWinNid
       : (v.nids && /^[0-9A-F]{64}$/i.test(String(v.nids.a || '')) ? v.nids.a : null);
-    const card = cardNid ? `${base}/card/${esc(cardNid)}.svg` : '';
+    // A settled fight gets the fight card, which shows the actual arithmetic. An unsettled one has
+    // no numbers to show, so it falls back to the challenger's pet. PNG in both cases: no platform
+    // rasterises SVG, so an SVG og:image is the same as having none.
+    const card = !unresolved ? `${base}/bcard/${esc(battleId)}.png`
+      : cardNid ? `${base}/card/${esc(cardNid)}.png` : '';
 
     const row = (nm, roll, pow, score, won) => `<div class="side${won ? ' win' : ''}">
       <div class="nm">${esc(nm)}${won ? ' <span class="crown">👑</span>' : ''}</div>
