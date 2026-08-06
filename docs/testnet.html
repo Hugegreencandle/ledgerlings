@@ -163,6 +163,12 @@
   <div id="fightBox" style="display:none;margin-top:10px;padding:11px;border:1px solid var(--glow);border-radius:10px;background:#0e3a4a;text-align:left">
     <div style="color:var(--hot);margin-bottom:6px">🥊 Fight Club — pet vs pet</div>
     <div style="opacity:.72;font-size:12px;margin-bottom:8px">Start a fight and share the battle id, or paste one somebody sent you. Free — 1 drop from each side, settled on the ledger. The dice are the hash of a ledger that has not closed yet when the second pet commits, so nobody can know or rig the result.</div>
+    <!-- GHOSTS FIRST. A duel needs two people to sign inside a window, and most owners here signed
+         once at adoption and never again, so pvpPlayed sat at 0 for a week. A ghost fight needs one
+         human. It is listed above the invite for that reason: it is the path that actually works. -->
+    <div style="color:var(--hot);font-size:12px;margin-bottom:3px">👻 Fight a ghost — no waiting</div>
+    <div style="opacity:.72;font-size:11px;margin-bottom:6px">Fight a snapshot of somebody else's pet. They don't need to be online, or to agree, and nothing lands on their record — only yours. Same dice as everything else: the hash of a ledger that hasn't closed yet.</div>
+    <div id="ghostList" style="display:grid;gap:5px;margin-bottom:9px"></div>
     <button id="fightNew" style="width:100%;padding:8px;border-radius:8px;border:1px solid var(--glow);background:#12586b;color:#dff;font:inherit;font-size:12px;cursor:pointer;text-align:left">⚔️ <b style="color:var(--hot)">Start a fight</b> <span style="opacity:.6">— get a battle id to share</span></button>
     <div id="fightIdRow" style="display:none;margin-top:6px;padding:7px;border-radius:8px;border:1px dashed var(--glow);background:#062430">
       <div style="opacity:.6;font-size:11px;margin-bottom:3px">your battle id — send this to your opponent</div>
@@ -1304,7 +1310,7 @@ function watchBattle(battleId, msgEl, maxTries){
         // A permalink to the full arithmetic. This is the thing worth sending to somebody.
         showFightLink(battleId);
         noteFairness(battleId, msg);
-        refreshRank(); pullLive(); loadBoard();
+        refreshRank(); pullLive(); loadBoard(); loadGhosts();
       }
     }catch{ /* keep waiting */ }
   },FIGHT_POLL_MS);
@@ -1358,7 +1364,7 @@ function setMode(){
         // loadBoard() again. Reload it instead: it re-shows the box and syncFightControls() greys the
         // action buttons off petNid, which is now null. syncFightControls() is also called directly:
         // loadBoard() early-returns on a fetch failure and the controls must grey out regardless.
-        syncFightControls(); loadBoard();
+        syncFightControls(); loadBoard(); loadGhosts();
         setMode(); refreshOps(); toast('account cleared');
       };
     }
@@ -1399,12 +1405,80 @@ function syncFightControls(){
     // so a player arriving on a challenge link met a dead form with no explanation at all.
     el.title=on?'':'Adopt a pet first — it is free and needs no wallet.';
   });
+  // The ghost roster is rendered dynamically, so it is not in the id list above. It was left looking
+  // fully enabled while every other control greyed out, which is the same dead-form-with-no-
+  // explanation problem that greeted a player arriving on a challenge link.
+  greyGhosts(on);
+}
+function greyGhosts(on){
+  for(const el of document.querySelectorAll('#ghostList button')){
+    el.disabled=!on;
+    el.style.opacity=on?'1':'.45';
+    el.style.cursor=on?'pointer':'default';
+    el.title=on?'Fight this pet’s ghost. Its owner is not involved and takes no loss.'
+               :'Adopt a pet first — it is free and needs no wallet.';
+  }
 }
 
 // Flow A: create a challenge, surface the battle id to share.
 // Deliberately no optimistic animation here — challengeRung() plays a WIN before the dice exist,
 // which is exactly the kind of thing this project cannot afford to show. Fight Club animates only
 // from the real on-ledger result, inside watchBattle().
+// The ghost roster. /ghosts PROJECTS every pet to the current ledger before deciding it is alive,
+// so this list never offers a fight against a pet that is already gone — the stored state on
+// /gallery would happily show one as healthy, because decay only commits when its owner transacts.
+let GHOSTS=[];
+async function loadGhosts(){
+  const list=document.getElementById('ghostList'); if(!list||!BK()) return;
+  let j=null;
+  try{ j=await (await fetch(BK()+'/ghosts'+(OWNER?('?owner='+encodeURIComponent(OWNER)):''))).json(); }catch{ return; }
+  if(!j||j.error||!Array.isArray(j.ghosts)) return;
+  GHOSTS=j.ghosts;
+  list.innerHTML='';
+  if(!GHOSTS.length){
+    const d=document.createElement('div');
+    d.style.cssText='opacity:.6;font-size:11px';
+    d.textContent='no living pets to fight yet.';
+    list.appendChild(d); return;
+  }
+  const mine = petNid ? (GHOSTS.find(g=>g.nid===petNid)||null) : null;   // never listed, but guard anyway
+  for(const g of GHOSTS.slice(0,8)){
+    if(mine && g.nid===petNid) continue;
+    const b=document.createElement('button');
+    b.style.cssText='width:100%;padding:7px 8px;border-radius:8px;border:1px solid var(--glow);'
+      +'background:#0d4557;color:#dff;font:inherit;font-size:11px;cursor:pointer;text-align:left';
+    const who = g.name ? g.name : g.nid.slice(-6);
+    // Built as DOM, never innerHTML: pet names are supplied by whoever adopted the pet, so
+    // interpolating one into markup would be stored XSS on every other player's screen.
+    // Power is shown because choosing WHO to fight is the only decision in a ghost fight. Hiding it
+    // would leave the player with no decision at all, which is the coin-flip complaint.
+    const nm=document.createElement('b'); nm.style.color='var(--hot)'; nm.textContent=who;
+    const meta=document.createElement('span'); meta.style.opacity='.65';
+    meta.textContent=' · '+g.stage+' · power '+g.power+' · care '+g.care;
+    b.appendChild(nm); b.appendChild(meta);
+    b.onclick=()=>ghostFight(g.nid, who);
+    list.appendChild(b);
+  }
+  greyGhosts(!!petNid);   // render and enabled-state decided together, never drifting apart
+}
+async function ghostFight(ghostNid, who){
+  if(!fightAwake()) return;
+  const j=await signRequest(
+    {kind:'ghost', owner:OWNER, nid:petNid, ghostNid},
+    'Fight a ghost',
+    `Approve a 1-drop challenge in Xaman. You are fighting a snapshot of ${who}, derived from its own `+
+    `ledger history. Its owner is not involved and takes no loss. The dice are the hash of a ledger `+
+    `that has not closed yet, so nobody can know or rig the result.`);
+  if(!j) return;
+  fightExpiry=null;                    // a ghost fight settles on its own; there is nothing to expire
+  watchSign(j.uuid, txid=>{
+    if(!txid) return;
+    fightBattleId=txid; fightRole='A';
+    const m=document.getElementById('fMsg');
+    if(m) m.textContent='fighting the ghost of '+who+'. Settling once the pinned ledger closes, about a minute.';
+    closeSign(undefined, ()=>watchBattle(txid, FIGHT_POLL_B_MAX, document.getElementById('fMsg')));
+  });
+}
 async function startFight(){
   if(!fightAwake()) return;
   const j=await signRequest(
@@ -1569,7 +1643,7 @@ function initFightClub(){
   document.getElementById('fightCopy').onclick=copyFightId;
   document.getElementById('fightCode').addEventListener('keydown',e=>{ if(e.key==='Enter') acceptFight(); });
   syncFightControls();
-  if(BK()){ box.style.display='block'; loadBoard(); }   // the board is public: no pet required
+  if(BK()){ box.style.display='block'; loadBoard(); loadGhosts(); }   // the board is public: no pet required
   acceptInviteFromUrl();
 }
 // Someone was sent a challenge link. Fill the code in, show them the fight they are being invited
@@ -1610,7 +1684,7 @@ async function keylessAdopt(addr, isAutoLoad){
   document.getElementById('keyless').style.display='none';
   await syncLedger(); setInterval(syncLedger,30000);
   setInterval(pullLive,15000);
-  showShare(); setMode(); refreshOps(); loadLadder(); loadBoard();
+  showShare(); setMode(); refreshOps(); loadLadder(); loadBoard(); loadGhosts();
   toast(isAutoLoad?'welcome back 💖':'adopted on mainnet 🎉');
 }
 
@@ -1625,7 +1699,7 @@ async function keylessAdopt(addr, isAutoLoad){
     }
     toast('connected: '+OWNER.slice(0,8)+'…');
     await syncLedger(); setInterval(syncLedger,30000);     // real ledger for cooldown gray-out
-    showShare(); loadLadder(); loadBoard();
+    showShare(); loadLadder(); loadBoard(); loadGhosts();
   } else if(BK()){
     let savedOwner=null;
     try{ savedOwner=localStorage.getItem('ll_owner'); }catch{}

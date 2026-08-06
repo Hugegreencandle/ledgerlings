@@ -1939,6 +1939,40 @@ app.get('/gallery', async (req, res) => {
     res.set('Cache-Control', 'public, max-age=30').json({ count: out.length, pets: out });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
+// Opponents available to fight as a GHOST. Unlike /gallery this PROJECTS each pet to the current
+// ledger before deciding whether it is alive, because the stored URI is only accurate as of the
+// owner's last transaction: a pet nobody has touched reads alive with full stats forever. Listing
+// those as opponents would offer fights that resolve to VOID, and would show a starving pet at the
+// strength it had days ago.
+//
+// `owner` is optional and only used to hide your own pets — the list itself is public, like the
+// gallery and the board.
+app.get('/ghosts', async (req, res) => {
+  try {
+    const owner = String(req.query.owner || '');
+    const out = await withClient(async (c, w) => {
+      const cur = (await c.request({ command: 'ledger', ledger_index: 'validated' })).result.ledger_index;
+      return (await allIssuerNfts(c, w.classicAddress))
+        .filter(n => n.NFTokenTaxon === TAXON && n.URI)
+        .map(n => {
+          let s; try { s = dec(n.URI); } catch { return null; }
+          if (!s) return null;
+          const p = projectTo(s, cur);                       // same call the resolver and verifier use
+          if (!p || p.alive === 0) return null;              // a passed pet cannot be fought
+          if (owner && p.owner === owner) return null;       // your own pets are not opponents
+          return { nid: n.NFTokenID, name: p.name || null, owner: p.owner,
+            stage: R.STAGE[p.stage] || p.stage, form: R.FORM[p.form] || '-',
+            power: BR.power(p), care: p.care, quality: Math.round(careRatio(p) * 100),
+            health: p.health, hunger: p.hunger, happiness: p.happiness };
+        })
+        .filter(Boolean);
+    });
+    // Strongest first: picking an opponent is the only real decision in a ghost fight, so the list
+    // has to make the trade-off legible rather than hiding it behind an arbitrary order.
+    out.sort((a, b) => (b.power - a.power) || (b.care - a.care));
+    res.set('Cache-Control', 'public, max-age=15').json({ count: out.length, asOfProjected: true, ghosts: out });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
 // public gallery page — best-cared leaderboard grid, each linking to its shareable pet page. No login.
 app.get('/gallery.html', (req, res) => {
   res.type('text/html').send(`<!doctype html><html lang="en"><head><meta charset="utf-8">
