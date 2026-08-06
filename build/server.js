@@ -516,7 +516,22 @@ async function resolveBattleTx(c, w, battleId) {
   if (b.result) return { status: 'ALREADY_RESOLVED', result: b.result };     // idempotent — never double-pay
   if (b.challenge.npc) return resolveLadder(c, w, battleId, b);               // ladder path (no accept/wager)
   if (!b.accept) return { status: 'OPEN', error: 'not accepted yet' };
-  const { aNid, N } = b.challenge, { bNid } = b.accept;
+  const { aNid } = b.challenge, { bNid } = b.accept;
+  // Seed ledger is derived from the ACCEPT's landing ledger, not from the challenge memo.
+  //
+  // The ladder path got this fix on 2026-07-30; this one did not, and it is worse here. PvP has TWO
+  // commitments, challenge then accept, and the memo pins N at the FIRST. BATTLE_LEDGER_MARGIN is
+  // small, so ledger N closes a minute or two after the challenge lands. The acceptor chooses when
+  // to accept. Any acceptor acting after that could read ledger N's hash, compute the winner, and
+  // only accept when they win — and this path moves real staked XRP.
+  //
+  // Counting from the accept means the seed is unknowable at the time of the LAST commitment,
+  // however slow either party is. The memo's N is kept only to flag the stale case and say so.
+  const claimedN = b.challenge.N;
+  const acceptLseq = b.accept.lseq;
+  if (!acceptLseq) return { error: 'accept ledger unknown', battleId };
+  const N = acceptLseq + BATTLE_LEDGER_MARGIN;
+  const staleCommitment = Number.isInteger(claimedN) && claimedN > 1000000 && claimedN <= acceptLseq;
   const lh = await ledgerHashOf(c, N);
   if (!lh) return { error: 'pinned ledger not validated yet', N };
   const seed = seedFor(lh, battleId, aNid, bNid);
@@ -558,7 +573,10 @@ async function resolveBattleTx(c, w, battleId) {
     const cr = (await c.submitAndWait(w.sign(cp).tx_blob)).result;
     card = { nid: cr.meta.nftoken_id, result: cr.meta.TransactionResult };
   } catch (e) { card = { error: e.message }; }
-  return { battleId, winner: winnerNid, scoreA: d.scoreA, scoreB: d.scoreB, rollA: d.rollA, rollB: d.rollB, powerA: d.powerA, powerB: d.powerB, seed, pot, fee, payout, card };
+  return { battleId, winner: winnerNid, scoreA: d.scoreA, scoreB: d.scoreB, rollA: d.rollA, rollB: d.rollB, powerA: d.powerA, powerB: d.powerB,
+    seed, seedLedger: N, acceptLedger: acceptLseq, claimedN,
+    staleCommitment: staleCommitment || undefined,   // memo pinned a ledger that had closed before the accept
+    pot, fee, payout, card };
 }
 // verify (public): re-derive winner + scores from the pinned ledger + open rules; confirm the payout went to the winner.
 async function verifyBattle(c, issuer, battleId) {
@@ -595,7 +613,14 @@ async function verifyBattle(c, issuer, battleId) {
     const legit = dA < stake || dB < stake;
     return { ok: legit, verdict: legit ? 'VOID' : 'FAIL', battleId, reason: legit ? 'voided: a party delivered less than the agreed stake; refunded' : 'VOID recorded but both stakes were fully delivered' };
   }
-  const { aNid, N } = b.challenge, { bNid } = b.accept;
+  const { aNid } = b.challenge, { bNid } = b.accept;
+  // SAME derivation as resolveBattleTx, for the same reason the ladder verifier uses it: verifying
+  // against the memo's N would confirm the arithmetic while missing whether the seed was knowable
+  // when the acceptor signed, which is the only property that makes a staked battle fair.
+  const claimedN = b.challenge.N;
+  const acceptLseq = b.accept.lseq;
+  const N = (acceptLseq || 0) + BATTLE_LEDGER_MARGIN;
+  const staleCommitment = Number.isInteger(claimedN) && claimedN > 1000000 && acceptLseq && claimedN <= acceptLseq;
   const lh = await ledgerHashOf(c, N);
   if (!lh) return { ok: false, verdict: 'ERROR', reason: 'pinned ledger not available' };
   const seed = seedFor(lh, battleId, aNid, bNid);
@@ -609,6 +634,10 @@ async function verifyBattle(c, issuer, battleId) {
   const paidRight = d.winner === null || b.result.dest === winnerOwner;
   const ok = winnerMatch && scoresMatch && paidRight;
   return { ok, verdict: ok ? 'PASS' : 'FAIL', battleId, N, seed,
+    seedLedger: N, acceptLedger: acceptLseq, claimedN,
+    ...(staleCommitment ? { warning: 'STALE_COMMITMENT', warningDetail:
+      `the challenge memo pinned ledger ${claimedN}, which had already closed when the accept landed in ${acceptLseq}. `
+      + 'That seed was public when the acceptor signed. Resolution used the derived ledger instead.' } : {}),
     derived: { winner: derivedWinner, scoreA: d.scoreA, scoreB: d.scoreB, winnerOwner }, recorded: b.result,
     reason: ok ? 'winner + scores re-derive from the pinned ledger hash and the open rules; payout went to the winner'
       : !winnerMatch ? 'recorded winner does not match a faithful replay'
