@@ -223,7 +223,13 @@ app.post('/adopt', async (req, res) => {
 // public config — lets the frontend stamp the Make Waves SourceTag on the PLAYER's own interaction Payment
 // (so distinct player accounts show on the leaderboard, not just issuer-built txns).
 app.get('/config', (req, res) => {
-  res.json({ sourceTag: SOURCE_TAG !== undefined ? SOURCE_TAG : null, taxon: TAXON, rulesetVersion: RULESET_VERSION });
+  // pngCards reports whether THIS RUNNING BUILD can actually rasterise text, and fontFile says
+  // which font it loaded. Both exist because a card that renders blank returns a perfectly valid
+  // HTTP 200 PNG of the right dimensions: status, content-type, magic bytes and size all pass while
+  // the image is empty. There was also no way to tell a stale deploy from a live-but-broken one,
+  // since the fix changed no HTTP surface. Now one request answers both questions.
+  res.json({ sourceTag: SOURCE_TAG !== undefined ? SOURCE_TAG : null, taxon: TAXON, rulesetVersion: RULESET_VERSION,
+    pngCards: pngStatus(), fontFile: FONT_FILE });
 });
 
 // current validated ledger — the frontend uses this as `now` for LIVE pets (real ledger indices) so it can
@@ -1605,16 +1611,22 @@ function genCardSvg(s, nid) {
 // have it, while the darwin-arm64 one does. TTF is fontdb's native format and is always supported.
 // The route still returned HTTP 200 with a valid PNG, so nothing failed loudly; it was only caught
 // by downloading the production image and LOOKING at it.
-let FONT_BUF = null;
+let FONT_BUF = null, FONT_FILE = null, PNG_STATUS = 'unprobed';
 function fontBuf() {
   if (FONT_BUF === null) {
     try {
-      FONT_BUF = require('fs').readFileSync(require.resolve('dejavu-fonts-ttf/ttf/DejaVuSans.ttf'));
+      const p = require.resolve('dejavu-fonts-ttf/ttf/DejaVuSans.ttf');
+      FONT_BUF = require('fs').readFileSync(p);
+      FONT_FILE = p.split('/').slice(-1)[0];
       probeFont();
-    } catch (e) { FONT_BUF = false; console.error('[png] font unavailable, PNG cards disabled:', e.message); }
+    } catch (e) {
+      FONT_BUF = false; PNG_STATUS = 'font-missing';
+      console.error('[png] font unavailable, PNG cards disabled:', e.message);
+    }
   }
   return FONT_BUF;
 }
+function pngStatus() { fontBuf(); return PNG_STATUS; }
 // Render a known string once and count the colours. A font the rasteriser accepts but cannot use
 // yields a picture with a background and nothing else, which is indistinguishable from success at
 // the HTTP layer. This turns that into a loud line in the deploy log.
@@ -1629,10 +1641,11 @@ function probeFont() {
     const px = new Resvg(svg, { font: { fontBuffers: [FONT_BUF], loadSystemFonts: false, defaultFontFamily: 'DejaVu Sans' } }).render().pixels;
     const seen = new Set();
     for (let i = 0; i < px.length; i += 4) seen.add((px[i] << 16) | (px[i + 1] << 8) | px[i + 2]);
-    if (seen.size > 2) console.log(`[png] font ok — probe rasterised ${seen.size} distinct colours`);
-    else console.error('[png] FONT LOADED BUT TEXT DOES NOT RASTERISE — every card will render blank. '
-      + 'This is the woff2-on-linux failure; the font must be a TTF.');
-  } catch (e) { console.error('[png] font probe failed:', e.message); }
+    if (seen.size > 2) { PNG_STATUS = 'ok'; console.log(`[png] font ok (${FONT_FILE}) — probe rasterised ${seen.size} distinct colours`); }
+    else { PNG_STATUS = 'blank-text';
+      console.error('[png] FONT LOADED BUT TEXT DOES NOT RASTERISE — every card will render blank. '
+        + 'This is the woff2-on-linux failure; the font must be a TTF.'); }
+  } catch (e) { PNG_STATUS = 'probe-failed'; console.error('[png] font probe failed:', e.message); }
 }
 // Map the emoji this codebase actually uses onto glyphs DejaVu HAS. Verified by rendering and
 // looking at the output: ✓ (2713), ✕ (2715), → (2192) and · (00B7) all rasterise correctly, so the
