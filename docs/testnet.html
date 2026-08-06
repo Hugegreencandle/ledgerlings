@@ -412,6 +412,9 @@ function mood(){ if(pet.alive===0)return'dead'; if(pet.health<35||pet.hunger<20|
 // Declared ABOVE tick(): the render loop starts on the next line block and calls scuffed() on its
 // FIRST frame, so a `let` further down the file is still in the temporal dead zone and throws
 // ReferenceError — which kills the render AND aborts the rest of the script (mode banner, adopt
+// Sign-modal timing. Declared above tick() on principle: a const below the render loop that
+// anything reachable from it touches is a TDZ ReferenceError on frame one.
+const SIGN_CLOSE_MS = 900, SIGN_SETTLE_MS = 260;
 let shakeK=0, shakeUntil=0;
 let lastFightLedger=null, lastFightWin=null;
 const BANDAID_LEDGERS=1800;                       // ~2h at ~4s ledgers: scuffed, then healed
@@ -996,7 +999,9 @@ async function runOp(op){
     if(r.local){ /* fell back */ } else if(!r.signed){ toast('cancelled'); return; }
     else { 
       toast(op+' signed! 💖 applying…'); lastJoy=performance.now();
-      if(op==='feed'||op==='play'||op==='clean'||op==='heal') triggerActionAnim(op);
+      // xApp path: Xaman's own sign sheet is still dismissing here, same problem, same beat.
+      if(op==='feed'||op==='play'||op==='clean'||op==='heal')
+        setTimeout(()=>triggerActionAnim(op), SIGN_CLOSE_MS + SIGN_SETTLE_MS);
       // the issuer poller applies the NFTokenModify within a few ledgers; poll for the authoritative state
       for(let i=0;i<8;i++){ await new Promise(r=>setTimeout(r,2500)); const live=petNid&&await XamanBridge.fetchPet(petNid); if(live)pet=live; }
       await syncLedger(); refreshOps(); return; }
@@ -1042,8 +1047,17 @@ async function signRequest(body, title, note){
 }
 // Close the sign overlay. Called automatically once Xaman resolves the payload so the user is
 // not left dismissing a dialog they have already finished with.
-function closeSign(delay){
-  setTimeout(()=>{ const ov=document.getElementById('lov'); if(ov) ov.classList.remove('on'); }, delay||900);
+// `after` runs once the overlay is ACTUALLY gone, plus a short beat for the fade.
+// Chris spotted that action animations were playing while the sign modal was still up, so the
+// user missed them. He suggested delaying the animation ~0.5s, but the modal does not close until
+// 900ms, so a fixed 500ms delay would still land underneath it. Chaining off the real close means
+// the ordering holds even if this delay is ever retuned, instead of two timers racing.
+function closeSign(delay, after){
+  const d = delay||SIGN_CLOSE_MS;
+  setTimeout(()=>{
+    const ov=document.getElementById('lov'); if(ov) ov.classList.remove('on');
+    if(after) setTimeout(after, SIGN_SETTLE_MS);
+  }, d);
 }
 
 // Watch a sign request to resolution.
@@ -1063,7 +1077,8 @@ function watchSign(uuid, onSigned, opts){
   const settle=(r)=>{
     if(done) return;
     const st=document.getElementById('sgStat');
-    if(r.signed){ done=true; stop(); if(st) st.textContent='signed ✓'; closeSign(); onSigned&&onSigned(r.txid,r.account); }
+    if(r.signed){ done=true; stop(); if(st) st.textContent='signed ✓';
+      closeSign(undefined, ()=>{ onSigned&&onSigned(r.txid,r.account); }); }
     else if(r.cancelled){ done=true; stop(); if(st) st.textContent='cancelled'; closeSign(1400); }
     else if(r.expired){ done=true; stop(); if(st) st.textContent='expired'; closeSign(1400); }
   };
