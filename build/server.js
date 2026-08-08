@@ -159,10 +159,19 @@ async function cached(key, ttlMs, fn) {
   _cache.set(key, { at: Date.now(), val });
   return val;
 }
-async function readState(c, issuer, nid) {
-  const r = await c.request({ command: 'account_nfts', account: issuer });
-  const n = r.result.account_nfts.find(x => x.NFTokenID === nid);
-  return n ? dec(n.URI) : null;
+// Holder-aware: a pet CLAIMED to a player's wallet leaves the issuer, so a plain issuer scan misses it.
+// Check the issuer first (unclaimed), then the ownerHint (the claimant, known from genesis.owner).
+async function resolveHolder(c, issuer, nid, ownerHint) {
+  const scan = async (acct) => {
+    const r = await c.request({ command: 'account_nfts', account: acct });
+    const n = r.result.account_nfts.find(x => x.NFTokenID === nid);
+    return n ? { holder: acct, uri: n.URI } : null;
+  };
+  return (await scan(issuer)) || (ownerHint && ownerHint !== issuer ? await scan(ownerHint) : null);
+}
+async function readState(c, issuer, nid, ownerHint) {
+  const h = await resolveHolder(c, issuer, nid, ownerHint);
+  return h ? dec(h.uri) : null;
 }
 async function submit(c, w, tx) {
   const prepared = await c.autofill(tag(tx));
@@ -224,7 +233,47 @@ app.post('/adopt', async (req, res) => {
       const prepared = await c.autofill(tag({ TransactionType: 'NFTokenMint', Account: w.classicAddress,
         NFTokenTaxon: TAXON, Flags: TF_MUTABLE_TRANSFERABLE, TransferFee: ROYALTY_BPS, URI: enc(R.genesis(now, owner, petName)) }));
       const rr = (await c.submitAndWait(w.sign(prepared).tx_blob)).result;
-      return { result: rr.meta.TransactionResult, nid: rr.meta.nftoken_id, state: R.genesis(now, owner, petName) };
+      const nid = rr.meta.nftoken_id;
+      // Make the pet CLAIMABLE to real self-custody: a 0-drop sell offer locked to the adopter. The pet works
+      // immediately (custodial, state in URI); the player accepts this offer in Xaman (via /claim-pet) whenever
+      // they want to own the NFT on-ledger. The issuer keeps modify rights (tfMutable) — see reconcile Owner=holder.
+      let claimOffer = null;
+      try {
+        const offTx = await c.autofill(tag({ TransactionType: 'NFTokenCreateOffer', Account: w.classicAddress,
+          NFTokenID: nid, Amount: '0', Flags: 1 /* tfSellNFToken */, Destination: owner }));
+        const orr = (await c.submitAndWait(w.sign(offTx).tx_blob)).result;
+        if (orr.meta.TransactionResult === 'tesSUCCESS') {
+          const so = (await c.request({ command: 'nft_sell_offers', nft_id: nid, ledger_index: 'validated' })).result.offers || [];
+          const mine = so.find(o => o.destination === owner && o.amount === '0');
+          claimOffer = mine ? mine.nft_offer_index : null;
+        }
+      } catch (e) { claimOffer = null; /* pet still works custodially; claim can be re-offered later */ }
+      return { result: rr.meta.TransactionResult, nid, state: R.genesis(now, owner, petName), claimOffer, custody: 'issuer', claimable: !!claimOffer };
+    });
+    res.json(out);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// claim-pet: PUBLIC. Returns the player-signable NFTokenAcceptOffer for the 0-drop claim offer created at
+// adopt. The player signs it (Xaman) → they OWN the pet on-ledger (account_nfts shows it). The issuer keeps
+// modify rights via NFTokenModify Owner=<player> (verified G1). No admin needed — accepting a destination-
+// locked 0-offer can only move the pet to the addressed player, so exposing it is safe.
+app.post('/claim-pet', async (req, res) => {
+  const { owner, nid } = req.body || {};
+  if (!owner || !xrpl.isValidClassicAddress(owner)) return res.status(400).json({ error: 'valid owner address required' });
+  if (!nid || !/^[0-9A-Fa-f]{64}$/.test(nid)) return res.status(400).json({ error: 'valid nid required' });
+  try {
+    const out = await withClient(async (c, w) => {
+      const issuer = w.classicAddress;
+      // already claimed?
+      const h = await resolveHolder(c, issuer, nid, owner);
+      if (h && h.holder === owner) return { alreadyOwned: true, nid };
+      const so = (await c.request({ command: 'nft_sell_offers', nft_id: nid, ledger_index: 'validated' })).result.offers || [];
+      const offer = so.find(o => o.destination === owner && o.amount === '0');
+      if (!offer) return { claimable: false, reason: 'no live claim offer for this address; ask the operator to re-offer', nid };
+      // unsigned tx the player signs (SourceTag stamped so the claim counts on the leaderboard too)
+      const acceptTx = tag({ TransactionType: 'NFTokenAcceptOffer', Account: owner, NFTokenSellOffer: offer.nft_offer_index });
+      return { claimable: true, nid, offerIndex: offer.nft_offer_index, unsignedTx: acceptTx };
     });
     res.json(out);
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -275,7 +324,7 @@ function replay(genesis, interactions) {
 // for THIS nid), each with its Payment ledger_index (= the deterministic `now`). Shared by the pet
 // verifier AND the achievements projection so both replay the exact same inputs.
 async function loadHistory(c, issuer, nid) {
-  const current = await readState(c, issuer, nid);
+  let current = await readState(c, issuer, nid);   // issuer-held (unclaimed) fast path
   // Bound the scan to the pet's own lifetime: its genesis mint is at ledger `birth` and every interaction is
   // after it, so ledger_index_min = birth guarantees we never miss genesis AND never truncate history — the
   // arbitrary count cap is gone (it silently caused false NO_GENESIS/DIVERGED as issuer volume grew). This also
@@ -308,10 +357,34 @@ async function loadHistory(c, issuer, nid) {
     marker = r.result.marker;
   } while (marker);
   interactions.sort((a, b) => a[1] - b[1]);
-  return { current, genesis, interactions };
+  // If the pet was CLAIMED (no longer issuer-held), current came back null above; re-read it from the
+  // claimant named in genesis.owner. holder = where the NFT lives now (issuer if unclaimed, else owner).
+  let holder = issuer;
+  if (!current && genesis && genesis.owner && genesis.owner !== issuer) {
+    const h = await resolveHolder(c, issuer, nid, genesis.owner);
+    if (h) { current = dec(h.uri); holder = h.holder; }
+  }
+  return { current, genesis, interactions, holder };
 }
 
 // verify a pet: re-derive it from its on-ledger history and compare to the on-chain state.
+// Enumerate EVERY pet ever minted by the issuer, from mint-tx history (taxon-filtered) — stateless, so it
+// finds pets that have been CLAIMED to players and thus left the issuer wallet (allIssuerNfts can't see those).
+// Hackathon-scale full scan; a per-nid index is the scale-up (same caveat as loadHistory).
+async function allMintedPetNids(c, issuer) {
+  const nids = new Set(); let marker;
+  do {
+    const r = await c.request({ command: 'account_tx', account: issuer, forward: true, limit: 200, marker });
+    for (const t of r.result.transactions) {
+      const tx = t.tx || t.tx_json || {};
+      if (tx.TransactionType === 'NFTokenMint' && tx.NFTokenTaxon === TAXON && t.meta && t.meta.nftoken_id) {
+        nids.add(t.meta.nftoken_id);
+      }
+    }
+    marker = r.result.marker;
+  } while (marker);
+  return [...nids];
+}
 async function verifyPet(c, issuer, nid) {
   const { current, genesis, interactions } = await loadHistory(c, issuer, nid);
   if (!current) return { ok: false, verdict: 'NOT_FOUND', reason: 'pet not found at issuer' };
@@ -1441,12 +1514,14 @@ app.post('/interact', requireAdmin, async (req, res) => {
     const [opName] = unhex(memo.MemoData).split('|');   // memo is "<op>|<nid>" (nid present for on-ledger verify)
     const op = R.OP[opName] || 0;
     const sender = tx.Account, now = tx.ledger_index;
-    // 3) apply the open rules, write the new state on-ledger
-    const state = await readState(c, w.classicAddress, nid);
-    if (!state) throw new Error('pet not found');
+    // 3) apply the open rules, write the new state on-ledger (holder-aware: pet may be claimed to the player)
+    const h = await resolveHolder(c, w.classicAddress, nid, sender);
+    if (!h) throw new Error('pet not found');
+    const state = dec(h.uri);
     const next = R.step(state, op, now, sender);            // sender !== owner ⇒ no-op (owner-only)
-    const result = await submit(c, w, { TransactionType: 'NFTokenModify',
-      Account: w.classicAddress, NFTokenID: nid, URI: enc(next) });
+    const modTx = { TransactionType: 'NFTokenModify', Account: w.classicAddress, NFTokenID: nid, URI: enc(next) };
+    if (h.holder !== w.classicAddress) modTx.Owner = h.holder;   // claimed pet: modify the player-held token
+    const result = await submit(c, w, modTx);
     // auto-award: mint any milestone badge this interaction just crossed (more live on-chain txns). Non-fatal.
     let achievements;
     if (AUTO_AWARD) { try { achievements = await claimAchievements(c, w, nid); } catch (e) { achievements = { error: e.message }; } }
@@ -1597,13 +1672,17 @@ app.post('/broker-sale', requireAdmin, async (req, res) => {
 // if the on-ledger URI differs, it NFTokenModifies to the derived state + auto-awards badges. Idempotent
 // (no-op once matched) and self-healing (actively enforces the same property /verify checks).
 async function reconcilePet(c, w, nid) {
-  const { current, genesis, interactions } = await loadHistory(c, w.classicAddress, nid);
+  const { current, genesis, interactions, holder } = await loadHistory(c, w.classicAddress, nid);
   if (!genesis || !current) return { nid, updated: false };
   const derived = replay(genesis, interactions);
   if (enc(derived) === enc(current)) return { nid, updated: false };
-  await submit(c, w, { TransactionType: 'NFTokenModify', Account: w.classicAddress, NFTokenID: nid, URI: enc(derived) });
+  // NFTokenModify targets the token wherever it lives: Owner set when the pet has been claimed to a player
+  // (verified G1: issuer can modify a player-owned mutable NFT with Owner=<holder>). Omit Owner when issuer-held.
+  const modTx = { TransactionType: 'NFTokenModify', Account: w.classicAddress, NFTokenID: nid, URI: enc(derived) };
+  if (holder && holder !== w.classicAddress) modTx.Owner = holder;
+  await submit(c, w, modTx);
   if (AUTO_AWARD) { try { await claimAchievements(c, w, nid); } catch { /* badge mint best-effort */ } }
-  return { nid, updated: true, state: derived };
+  return { nid, updated: true, state: derived, holder };
 }
 let pollerLastLedger = 0;
 // ── ladder auto-resolution ───────────────────────────────────────────────────────────────────────
@@ -1731,9 +1810,13 @@ async function startPoller() {
   if (!ISSUER_SEED) { console.warn('[poller] disabled — no LEDGERLINGS_ISSUER_SEED'); return; }
   const c = new xrpl.Client(ENDPOINT); await c.connect();
   const w = walletFromSeed(ISSUER_SEED); if (ISSUER_ADDRESS) w.classicAddress = ISSUER_ADDRESS;
-  // catch up every existing pet once, then only react to new interactions.
-  const pets = (await allIssuerNfts(c, w.classicAddress)).filter(n => n.NFTokenTaxon === TAXON);
-  for (const n of pets) { try { await reconcilePet(c, w, n.NFTokenID); } catch (e) { console.warn('[poller] init', e.message); } }
+  // catch up every existing pet once, then only react to new interactions. Enumerate issuer-HELD pets UNION
+  // every pet ever MINTED (from tx history) so CLAIMED pets — which have left the issuer wallet — are still
+  // caught up on restart. (pollerTick already reacts to their interactions live; this covers downtime.)
+  const heldNids = (await allIssuerNfts(c, w.classicAddress)).filter(n => n.NFTokenTaxon === TAXON).map(n => n.NFTokenID);
+  const mintedNids = await allMintedPetNids(c, w.classicAddress);
+  const pets = [...new Set([...heldNids, ...mintedNids])];
+  for (const nid of pets) { try { await reconcilePet(c, w, nid); } catch (e) { console.warn('[poller] init', e.message); } }
   pollerLastLedger = (await c.request({ command: 'ledger', ledger_index: 'validated' })).result.ledger_index;
   let openLadders = 0;
   try { openLadders = await scanOpenLadders(c, w.classicAddress); } catch (e) { console.warn('[poller] ladder scan', e.message); }
@@ -2217,7 +2300,7 @@ catch(e){o.textContent='could not reach the verifier';}};</script>
 module.exports = { app, withClient, readState, submit, verifyPet, replay, enc, dec, hex, unhex, R, TAXON, TF_MUTABLE_TRANSFERABLE, ROYALTY_BPS, ENDPOINT,
   A, loadHistory, encAch, decAch, listAchievements, claimAchievements, verifyAchievement, ACHIEVEMENT_TAXON, RULESET_VERSION,
   BR, seedFor, stateAtLedger, loadBattle, acceptWellFormed, pickAccept, refundBoth, resolveBattleTx, verifyBattle, ledgerHashOf, BATTLE_TAXON, BATTLE_FEE_BPS, BATTLE_LEDGER_MARGIN, BATTLE_MEMO,
-  reconcilePet, pollerTick, startPoller, allIssuerNfts, genCardSvg, careRatio, LADDER, resolveLadder,
+  reconcilePet, pollerTick, startPoller, allIssuerNfts, allMintedPetNids, genCardSvg, careRatio, LADDER, resolveLadder,
   BATTLE_CHALLENGE_TTL, noteLadderChallenge, pendingLadder, pendingPvp, resolvePendingPvp, resolvePendingLadders };
 
 if (require.main === module) {
