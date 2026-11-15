@@ -1,5 +1,10 @@
 # Ledgerlings — Make Waves MVP (XRPL Commons hackathon, 90 days from 2026-06-21)
 
+> **Correction (2026-11-15).** The table below cites `prove_period_budget` as proving a cumulative cap
+> ("no infinite farming"). An internal soundness review found that this driver (xahc-prover 8125029)
+> returns PROVEN on hooks that never record spending, so it does not establish a cumulative cap. Treat
+> that row as a design goal until a strengthened driver passes review.
+
 *The provably-fair on-chain pet. Built on the existing PROJECT.md; this is the hackathon-winnable scope.*
 
 ## Distribution unlock — ship it as a Xaman xApp (the "gets users" lever)
